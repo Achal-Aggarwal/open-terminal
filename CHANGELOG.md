@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.14.1] - 2026-10-16
+
+### Added
+
+- Command results now include the folder the command ran in, so assistants can see where each command started without running a separate command to check.
+
+### Fixed
+
+- Fixed file browsing in Open WebUI when Open Terminal runs directly on Windows. Opening a folder previously failed with a server error while checking whether its files could be edited.
+
 ## [0.14.0] - 2026-09-23
 
 ### Fixed
