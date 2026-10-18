@@ -7,8 +7,6 @@ import subprocess
 import time
 from abc import ABC, abstractmethod
 
-from open_terminal.utils.limits import worker_command
-
 try:
     import fcntl
     import pty
@@ -109,7 +107,8 @@ class PtyRunner(ProcessRunner):
             # Set a reasonable default window size (80x24).
             fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
             self._process = subprocess.Popen(
-                worker_command(["/bin/sh", "-c", command]),
+                command,
+                shell=True,
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
@@ -192,9 +191,8 @@ class PipeRunner(ProcessRunner):
         self._env = env
 
     async def start(self) -> None:
-        command = worker_command(["/bin/sh", "-c", self._command]) if os.name != "nt" else [os.environ.get("COMSPEC", "cmd.exe"), "/c", self._command]
-        self._process = await asyncio.create_subprocess_exec(
-            *command,
+        self._process = await asyncio.create_subprocess_shell(
+            self._command,
             start_new_session=os.name != "nt",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -205,7 +203,7 @@ class PipeRunner(ProcessRunner):
 
     async def read_output(self, log_file) -> None:
         async def read_stream(stream, label):
-            while line := await stream.read(4096):
+            async for line in stream:
                 if log_file:
                     await log_file.write(
                         json.dumps(

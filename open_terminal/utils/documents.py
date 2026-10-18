@@ -322,5 +322,5 @@ if __name__ == "__main__":
                 output.write(extractor(path))
         result = {}
     except Exception as exc:
-        result = {"error": str(exc)}
+        result = {"error": str(exc), "error_type": type(exc).__name__}
     json.dump(result, sys.stdout)

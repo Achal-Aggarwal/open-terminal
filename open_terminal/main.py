@@ -25,20 +25,20 @@ from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import quote as url_quote
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from starlette.datastructures import UploadFile as StarletteUploadFile
-from starlette.formparsers import MultiPartParser, MultiPartException
-from pydantic import BaseModel, Field
+from starlette.formparsers import MultiPartParser, MultiPartException, parse_options_header
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner, read_pty, write_pty, PtyRunner
-from open_terminal.utils.fs import UserFS, TemporaryFileResponse, text_file_response, line_range_offsets
-from open_terminal.utils.limits import (CHUNK_SIZE, ResourceLimitError, ResourceLimitsMiddleware, run_io, run_worker, worker_command)
+from open_terminal.utils.fs import UserFS, FullFileResponse as FileResponse, TemporaryFileResponse, text_file_response, line_range_offsets
+from open_terminal.utils.limits import (CHUNK_SIZE, NormalizeNullQueryMiddleware, run_io, run_worker)
 from open_terminal.utils.file_compare import CompareRequest, run_comparison
-from open_terminal.utils.search import search_entries, walk_entries, matching_files, ranked_page
+from open_terminal.utils.search import search_entries, matching_files, ranked_page
 from open_terminal.utils.skills import join_skill_path, list_skill_resources, parse_skill_frontmatter
 
 MATCH_PAGE_SIZE = 100
@@ -193,7 +193,10 @@ async def _preview_pdf(target: str) -> str | None:
         ])
         pdf = os.path.join(tmpdir, os.path.splitext(os.path.basename(target))[0] + ".pdf")
         if not os.path.isfile(pdf):
-            return None
+            matches = sorted(name for name in os.listdir(tmpdir) if name.lower().endswith(".pdf"))
+            if not matches:
+                return None
+            pdf = os.path.join(tmpdir, matches[0])
         fd, result = tempfile.mkstemp(suffix=".pdf")
         os.close(fd)
         try:
@@ -234,7 +237,7 @@ app = FastAPI(
     description="A remote terminal API.",
     version=_pkg_version("open-terminal"),
 )
-app.add_middleware(ResourceLimitsMiddleware)
+app.add_middleware(NormalizeNullQueryMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in CORS_ALLOWED_ORIGINS.split(",")],
@@ -249,13 +252,6 @@ async def permission_error_handler(request: Request, exc: PermissionError):
     return JSONResponse(status_code=403, content={"detail": str(exc)})
 
 
-@app.exception_handler(ResourceLimitError)
-async def resource_limit_handler(request: Request, exc: ResourceLimitError):
-    return JSONResponse(status_code=413, content={"detail": str(exc)})
-
-
-
-
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -263,7 +259,7 @@ async def resource_limit_handler(request: Request, exc: ResourceLimitError):
 
 class ExecRequest(BaseModel):
     command: str = Field(
-        ..., max_length=16384,
+        ...,
         description="Shell command to execute. Supports chaining (&&, ||, ;), pipes (|), and redirections.",
         json_schema_extra={"examples": ["echo hello", "ls -la && whoami"]},
     )
@@ -375,7 +371,6 @@ class BackgroundProcess:
     runner: ProcessRunner
     status: str = "running"
     exit_code: Optional[int] = None
-    error: Optional[str] = None
     log_task: Optional[asyncio.Task] = field(default=None, repr=False)
     input_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     finished_at: Optional[float] = field(default=None, repr=False)
@@ -420,12 +415,10 @@ def _set_session_cwd(session_id: str | None, path: str):
     """Store a session's cwd.  No-op if *session_id* is ``None``."""
     if session_id:
         _expire_session_cwds()
-        if session_id not in _session_cwds and len(_session_cwds) >= 1024:
-            del _session_cwds[min(_session_cwds, key=lambda key: _session_cwds[key][1])]
         _session_cwds[session_id] = (path, time.time())
 
 
-from open_terminal.utils.log import log_process, read_log
+from open_terminal.utils.log import log_process, log_response
 
 
 
@@ -433,9 +426,8 @@ from open_terminal.utils.log import log_process, read_log
 def _cleanup_expired():
     now = time.time()
     finished = [p for p in _processes.values() if p.finished_at is not None]
-    finished.sort(key=lambda p: p.finished_at)
-    for index, process in enumerate(finished):
-        if now - process.finished_at > _EXPIRY_SECONDS or index < len(finished) - 256:
+    for process in finished:
+        if now - process.finished_at > _EXPIRY_SECONDS:
             _processes.pop(process.id, None)
 
 
@@ -461,8 +453,7 @@ async def _maintenance_loop():
         _expire_session_cwds()
         if ENABLE_TERMINAL:
             for sid, session in list(_terminal_sessions.items()):
-                idle = time.time() - session["last_active"]
-                if not _session_is_alive(session) or (not session["connected"] and idle > 60):
+                if not _session_is_alive(session):
                     await _cleanup_session(sid)
         active = {p.log_path for p in _processes.values() if p.finished_at is None}
         try:
@@ -567,14 +558,15 @@ async def _list_skills_in_dir(fs: UserFS, root: str, scope: str) -> list[SkillSu
         name = (frontmatter.get("name") or dirname).strip()
         if not name:
             continue
-        skill = SkillSummary(
-            id=f"terminal:{url_quote(name, safe='')}",
-            name=name,
-            description=description[:1024],
-            location=skill_path,
-            scope=scope,
+        skills.append(
+            SkillSummary(
+                id=f"terminal:{url_quote(name, safe='')}",
+                name=name,
+                description=description[:1024],
+                location=skill_path,
+                scope=scope,
+            )
         )
-        skills.append(skill)
     return skills
 
 
@@ -758,13 +750,15 @@ async def read_file(
                 request=http_request, timeout=None,
             ))
             if "error" in result:
+                if result.get("error_type") == "PermissionError":
+                    raise PermissionError(result["error"])
                 raise ValueError(result["error"])
             return await text_file_response(extracted_path, target, start_line, end_line, False)
         finally:
             os.unlink(extracted_path)
     if any(mime.startswith(prefix) for prefix in BINARY_FILE_MIME_PREFIXES):
         return FileResponse(target, media_type=mime)
-    raise HTTPException(415, f"Unsupported binary file type: {mime}")
+    raise HTTPException(415, f"Unsupported binary file type: {mime} ({os.path.getsize(target)} bytes)")
 
 
 @app.get(
@@ -1347,7 +1341,7 @@ class UploadParser(MultiPartParser):
             return await super().parse()
         except BaseException:
             # Starlette closes these on MultiPartException only. Disconnects,
-            # cancellation, and body-limit errors must release spools as well.
+            # cancellation and other read errors must release spools as well.
             for file in self._files_to_close_on_error:
                 file.close()
             raise
@@ -1371,13 +1365,24 @@ async def upload_file(
     fs: UserFS = Depends(get_filesystem),
 ):
     try:
-        form = await UploadParser(http_request.headers, http_request.stream()).parse()
+        content_type, _ = parse_options_header(http_request.headers.get("content-type"))
+        if content_type == b"multipart/form-data":
+            form = await UploadParser(http_request.headers, http_request.stream()).parse()
+        else:
+            form = await http_request.form()
     except MultiPartException as exc:
         raise HTTPException(400, exc.message) from None
     file = form.get("file")
-    if not isinstance(file, StarletteUploadFile):
+    try:
+        if file is None or file == "":
+            raise RequestValidationError([{"type": "missing", "loc": ("body", "file"), "msg": "Field required", "input": None}])
+        file = TypeAdapter(UploadFile).validate_python(file)
+    except ValidationError as exc:
         await form.close()
-        raise HTTPException(422, "One multipart file named 'file' is required.")
+        raise RequestValidationError([{**error, "loc": ("body", "file", *error["loc"])} for error in exc.errors(include_url=False)]) from exc
+    except BaseException:
+        await form.close()
+        raise
     filename = os.path.basename(file.filename or "upload")
     directory = fs.resolve_path(directory)
     path = os.path.normpath(os.path.join(directory, filename))
@@ -1438,20 +1443,28 @@ async def archive_paths(
     os.close(fd)
     stop = threading.Event()
 
+    def archive_files(target):
+        if os.path.isfile(target):
+            yield target
+        elif os.path.isdir(target):
+            for directory, dirs, files in os.walk(target):
+                dirs[:] = [name for name in dirs if fs.is_path_allowed(os.path.join(directory, name))]
+                for name in files:
+                    full = os.path.join(directory, name)
+                    if fs.is_path_allowed(full):
+                        yield full
+
     def _build_zip():
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
             for target in resolved:
                 fs._check_path(target)
-                entries = [(target, "file")] if os.path.isfile(target) else walk_entries(fs, target)
-                for full, entry_type in entries:
-                    if entry_type != "file":
-                        continue
+                for full in archive_files(target):
                     if stop.is_set():
                         return
                     arcname = os.path.basename(full) if full == target else os.path.join(os.path.basename(target.rstrip("/\\")) or "dir", os.path.relpath(full, target))
                     info = zipfile.ZipInfo.from_file(full, arcname)
                     info.compress_type = zipfile.ZIP_DEFLATED
-                    with open(full, "rb") as source, archive.open(info, "w", force_zip64=True) as destination:
+                    with open(full, "rb") as source, archive.open(info, "w") as destination:
                         while chunk := source.read(CHUNK_SIZE):
                             if stop.is_set():
                                 return
@@ -1460,7 +1473,7 @@ async def archive_paths(
     task = asyncio.create_task(asyncio.to_thread(_build_zip))
     try:
         await asyncio.shield(task)
-        return TemporaryFileResponse(temporary, media_type="application/zip", filename=f"{archive_name}.zip")
+        return TemporaryFileResponse(temporary, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{archive_name}.zip"'})
     except BaseException:
         stop.set()
         await asyncio.gather(task, return_exceptions=True)
@@ -1488,10 +1501,9 @@ async def list_processes(http_request: Request):
     return [
         {
             "id": background_process.id,
-            "command": background_process.command[:1024],
+            "command": background_process.command,
             "status": background_process.status,
             "exit_code": background_process.exit_code,
-            "error": background_process.error,
             "log_path": background_process.log_path,
         }
         for background_process in _processes.values()
@@ -1554,22 +1566,14 @@ async def execute(
         except asyncio.TimeoutError:
             pass
 
-    output, next_offset, truncated = await read_log(
-        background_process.log_path, offset=0, tail=tail
-    )
-
-    return {
+    return await log_response(background_process.log_path, {
         "id": process_id,
         "command": request.command,
         "cwd": cwd,
         "status": background_process.status,
         "exit_code": background_process.exit_code,
-        "error": background_process.error,
-        "output": output,
-        "truncated": truncated,
-        "next_offset": next_offset,
         "log_path": background_process.log_path,
-    }
+    }, offset=0, tail=tail)
 
 
 @app.get(
@@ -1615,21 +1619,13 @@ async def get_status(
         except asyncio.TimeoutError:
             pass
 
-    output, next_offset, truncated = await read_log(
-        background_process.log_path, offset=offset, tail=tail
-    )
-
-    return {
+    return await log_response(background_process.log_path, {
         "id": background_process.id,
         "command": background_process.command,
         "status": background_process.status,
         "exit_code": background_process.exit_code,
-        "error": background_process.error,
-        "output": output,
-        "truncated": truncated,
-        "next_offset": next_offset,
         "log_path": background_process.log_path,
-    }
+    }, offset=offset, tail=tail)
 
 
 @app.post(
@@ -1654,15 +1650,13 @@ async def send_input(process_id: str, body: InputRequest, http_request: Request)
     text = body.input.encode("raw_unicode_escape").decode("unicode_escape")
 
     try:
-        async with asyncio.timeout(5), background_process.input_lock:
+        async with background_process.input_lock:
             if isinstance(background_process.runner, PtyRunner):
                 await write_pty(background_process.runner._master_fd, text.encode())
             else:
                 background_process.runner.write_input(text.encode())
             if isinstance(background_process.runner, PipeRunner):
                 await background_process.runner.drain_input()
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=408, detail="Process is not accepting input")
     except (BrokenPipeError, ConnectionResetError, OSError):
         raise HTTPException(status_code=400, detail="Process stdin is closed")
 
@@ -1686,15 +1680,13 @@ async def kill_process(
     force: bool = Query(False, description="Send SIGKILL instead of SIGTERM."),
 ):
     background_process = _get_process(process_id, http_request)
-    if background_process.finished_at is None:
+    if background_process.status == "running":
         background_process.status = "killed"
         background_process.runner.kill(force=force)
-        try:
-            await asyncio.wait_for(asyncio.shield(background_process.log_task), 3)
-        except asyncio.TimeoutError:
-            background_process.runner.kill(force=True)
-            await asyncio.shield(background_process.log_task)
-    return {"status": background_process.status}
+        # The log task owns draining, reaping and closing the runner.
+        await asyncio.shield(background_process.log_task)
+    background_process.finished_at = time.time()
+    return {"status": "killed"}
 
 
 # ---------------------------------------------------------------------------
@@ -1806,7 +1798,7 @@ async def port_proxy(port: int, path: str, request: Request):
         )
 
     response_headers = dict(upstream.headers)
-    for h in ("transfer-encoding", "connection"):
+    for h in ("transfer-encoding", "connection", "content-encoding", "content-length"):
         response_headers.pop(h, None)
 
     class ProxyResponse(StreamingResponse):
@@ -1816,7 +1808,7 @@ async def port_proxy(port: int, path: str, request: Request):
             finally:
                 await upstream.aclose()
 
-    return ProxyResponse(upstream.aiter_raw(), status_code=upstream.status_code, headers=response_headers)
+    return ProxyResponse(upstream.aiter_bytes(), status_code=upstream.status_code, headers=response_headers)
 
 
 # ---------------------------------------------------------------------------
@@ -1949,7 +1941,7 @@ if ENABLE_TERMINAL:
                 spawn_env = os.environ.copy()
                 spawn_env.setdefault("TERM", TERMINAL_TERM)
                 process = subprocess.Popen(
-                    worker_command(shell_cmd),
+                    shell_cmd,
                     stdin=slave_fd,
                     stdout=slave_fd,
                     stderr=slave_fd,
@@ -1999,7 +1991,6 @@ if ENABLE_TERMINAL:
             output=bytearray(),
             connected=False,
             input_lock=asyncio.Lock(),
-            last_active=time.time(),
         )
         return {
             "id": session_id,
@@ -2031,7 +2022,6 @@ if ENABLE_TERMINAL:
 
 
     async def _write_terminal(session: dict, data: bytes):
-        session["last_active"] = time.time()
         async with session["input_lock"]:
             if session["backend"] == "pty":
                 await write_pty(session["master_fd"], data)
@@ -2197,7 +2187,6 @@ if ENABLE_TERMINAL:
                 data = await read_pty(master_fd) if backend == "pty" else await loop.run_in_executor(None, _blocking_read)
                 if not data:
                     break
-                session["last_active"] = time.time()
                 session["output"].extend(data)
                 del session["output"][:-65536]
                 await ws.send_bytes(data)

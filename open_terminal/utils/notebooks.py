@@ -1,66 +1,65 @@
-"""Bounded notebook sessions with explicit kernel ownership and cleanup."""
+"""Jupyter notebook execution endpoints.
+
+Provides per-cell execution with multi-session support. Each session gets its
+own Jupyter kernel via nbclient. Requires the ``notebooks`` optional extra::
+
+    pip install open-terminal[notebooks]
+"""
+
 import asyncio
 import json
 import os
 import time
 import uuid
+from typing import Optional
 
 import aiofiles
-import nbformat
-from nbclient import NotebookClient
-from nbclient.exceptions import CellExecutionError
-from jupyter_client import AsyncKernelManager
-from jupyter_client.asynchronous.client import AsyncKernelClient
-from jupyter_client.connect import channel_socket_types
-import zmq
-from fastapi import APIRouter, Depends, HTTPException
+import aiofiles.os
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from open_terminal.utils.limits import MAX_RESPONSE_BYTES, ResourceLimitError, worker_command
-
-_IDLE_TIMEOUT = 30 * 60
-_sessions = {}
-_cleanup_task = None
+import nbformat
+from nbclient import NotebookClient
 
 
-class LimitedKernelClient(AsyncKernelClient):
-    def _create_connected_socket(self, channel, identity=None):
-        # Set transport budgets before connecting, so one output message cannot
-        # allocate an arbitrary amount of memory before nbclient sees it.
-        sock = self.context.socket(channel_socket_types[channel])
-        sock.linger = 1000
-        sock.setsockopt(zmq.MAXMSGSIZE, MAX_RESPONSE_BYTES)
-        sock.setsockopt(zmq.RCVHWM, 8)
-        if identity:
-            sock.identity = identity
-        sock.connect(self._make_url(channel))
-        return sock
+# ---------------------------------------------------------------------------
+# Session manager
+# ---------------------------------------------------------------------------
 
-
-class LimitedKernelManager(AsyncKernelManager):
-    def format_kernel_cmd(self, extra_arguments=None):
-        return worker_command(super().format_kernel_cmd(extra_arguments))
-
-
-class LimitedNotebookClient(NotebookClient):
-    output_bytes = 0
-
-    def process_message(self, msg, cell, cell_index):
-        kind = msg.get("msg_type", "")
-        if kind.startswith("comm"):
-            return None  # Widget state is not part of the cell-output API.
-        if kind in {"stream", "display_data", "update_display_data", "execute_result", "error"}:
-            self.output_bytes += len(json.dumps(msg["content"], ensure_ascii=False).encode())
-            if self.output_bytes > MAX_RESPONSE_BYTES:
-                raise ResourceLimitError("Notebook output exceeded the byte limit; kernel stopped.")
-        return super().process_message(msg, cell, cell_index)
+_IDLE_TIMEOUT = 30 * 60  # 30 minutes
 
 
 class _Session:
-    def __init__(self, session_id, path, nb, client):
-        self.id, self.path, self.nb, self.client = session_id, path, nb, client
+    """Wraps a NotebookClient for a specific notebook."""
+
+    __slots__ = ("id", "path", "nb", "client", "busy", "created_at", "last_used")
+
+    def __init__(self, session_id: str, path: str, nb, client):
+        self.id = session_id
+        self.path = path
+        self.nb = nb
+        self.client = client
         self.busy = False
-        self.created_at = self.last_used = time.time()
+        self.created_at = time.time()
+        self.last_used = time.time()
+
+
+_sessions: dict[str, _Session] = {}
+_cleanup_task: Optional[asyncio.Task] = None
+
+
+async def _idle_cleanup_loop():
+    """Periodically remove sessions idle for more than _IDLE_TIMEOUT."""
+    while True:
+        await asyncio.sleep(60)
+        now = time.time()
+        stale = [
+            sid
+            for sid, s in _sessions.items()
+            if now - s.last_used > _IDLE_TIMEOUT and not s.busy
+        ]
+        for sid in stale:
+            await _destroy_session(sid)
 
 
 async def _close_client(client):
@@ -68,25 +67,20 @@ async def _close_client(client):
         await client._async_cleanup_kernel()
     except Exception:
         # A failed handshake can leave only the manager initialized.
-        if client.km and await client.km.is_alive():
-            await client.km.shutdown_kernel(now=True)
+        try:
+            if client.km and await client.km.is_alive():
+                await client.km.shutdown_kernel(now=True)
+        except Exception:
+            pass
+        finally:
+            if client.kc:
+                client.kc.stop_channels()
 
 
 async def _destroy_session(session_id):
     session = _sessions.pop(session_id, None)
-    if session:
+    if session and session.client:
         await _close_client(session.client)
-
-
-async def _idle_cleanup_loop():
-    while True:
-        await asyncio.sleep(60)
-        for sid, session in list(_sessions.items()):
-            if not session.busy and time.time() - session.last_used > _IDLE_TIMEOUT:
-                try:
-                    await _destroy_session(sid)
-                except Exception:
-                    pass
 
 
 def _ensure_cleanup_task():
@@ -104,6 +98,11 @@ async def shutdown_notebooks():
     await asyncio.gather(*(_destroy_session(sid) for sid in list(_sessions)), return_exceptions=True)
 
 
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
+
+
 class CreateSessionRequest(BaseModel):
     path: str = Field(..., description="Absolute path to the .ipynb file.")
 
@@ -116,12 +115,14 @@ class CreateSessionResponse(BaseModel):
 
 class ExecuteCellRequest(BaseModel):
     cell_index: int = Field(..., description="Zero-based cell index to execute.")
-    source: str | None = Field(None, max_length=MAX_RESPONSE_BYTES)
+    source: Optional[str] = Field(
+        None, description="Override cell source. If omitted, uses the source already in the notebook."
+    )
 
 
 class ExecuteCellResponse(BaseModel):
     status: str
-    execution_count: int | None = None
+    execution_count: Optional[int] = None
     outputs: list = Field(default_factory=list)
 
 
@@ -132,104 +133,177 @@ class SessionStatusResponse(BaseModel):
     status: str
 
 
-def create_notebooks_router(verify_api_key):
-    router = APIRouter(prefix="/notebooks", tags=["notebooks"], dependencies=[Depends(verify_api_key)])
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
 
-    @router.post("", response_model=CreateSessionResponse, operation_id="create_notebook_session", include_in_schema=False)
+
+def create_notebooks_router(verify_api_key) -> APIRouter:
+    """Create the notebooks router with the given auth dependency."""
+
+    router = APIRouter(
+        prefix="/notebooks",
+        tags=["notebooks"],
+        dependencies=[Depends(verify_api_key)],
+    )
+
+
+
+    @router.post(
+        "",
+        response_model=CreateSessionResponse,
+        operation_id="create_notebook_session",
+        summary="Create a notebook session",
+        description="Start a Jupyter kernel for the given notebook. Returns a session ID for subsequent execute calls.",
+        include_in_schema=False,
+    )
     async def create_session(req: CreateSessionRequest):
-        client = None
-        registered = False
-        try:
-            _ensure_cleanup_task()
-            path = os.path.abspath(req.path)
-            try:
-                async with aiofiles.open(path, "rb") as source:
-                    content = await source.read(MAX_RESPONSE_BYTES + 1)
-            except FileNotFoundError:
-                raise HTTPException(404, "Notebook not found")
-            if len(content) > MAX_RESPONSE_BYTES:
-                raise ResourceLimitError("Notebook exceeds the input size limit; clear saved outputs or split it.")
-            try:
-                nb = nbformat.reads(content.decode("utf-8"), as_version=4)
-            except Exception as exc:
-                raise HTTPException(400, f"Invalid notebook: {str(exc)[:500]}") from None
-            if len(nb.cells) > 1000:
-                raise ResourceLimitError("Notebook exceeds the cell count limit.")
-            kernel_name = nb.metadata.get("kernelspec", {}).get("name", "python3")
-            client = LimitedNotebookClient(nb, kernel_name=kernel_name, kernel_manager_class=LimitedKernelManager,
-                timeout=120, startup_timeout=30, store_widget_state=False, record_timing=False)
-            try:
-                async with asyncio.timeout(40):
-                    client.create_kernel_manager()
-                    client.km.client_class = "open_terminal.utils.notebooks.LimitedKernelClient"
-                    await client.async_start_new_kernel(cwd=os.path.dirname(path))
-                    await client.async_start_new_kernel_client()
-            except Exception as exc:
-                raise HTTPException(500, f"Failed to start kernel: {str(exc)[:500]}") from None
-            sid = uuid.uuid4().hex[:12]
-            _sessions[sid] = _Session(sid, path, nb, client)
-            registered = True
-            return CreateSessionResponse(id=sid, kernel=kernel_name, status="ready")
-        finally:
-            if client and not registered:
-                await _close_client(client)
 
-    @router.post("/{session_id}/execute", response_model=ExecuteCellResponse, operation_id="execute_notebook_cell", include_in_schema=False)
+        _ensure_cleanup_task()
+
+        path = os.path.abspath(req.path)
+        if not await aiofiles.os.path.isfile(path):
+            raise HTTPException(status_code=404, detail=f"Notebook not found: {path}")
+
+        # Read and parse the notebook
+        async with aiofiles.open(path, encoding="utf-8") as f:
+            content = await f.read()
+
+        try:
+            nb = nbformat.reads(content, as_version=4)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid notebook: {e}")
+
+        kernel_name = nb.metadata.get("kernelspec", {}).get("name", "python3")
+
+        # Start kernel — follow nbclient's setup_kernel pattern
+        client = NotebookClient(nb, kernel_name=kernel_name, timeout=120)
+        try:
+            client.create_kernel_manager()
+            await client.async_start_new_kernel()
+            await client.async_start_new_kernel_client()
+        except BaseException as e:
+            await _close_client(client)
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to start kernel '{kernel_name}': {e}",
+            )
+
+        session_id = uuid.uuid4().hex[:12]
+        _sessions[session_id] = _Session(session_id, path, nb, client)
+
+        return CreateSessionResponse(
+            id=session_id, kernel=kernel_name, status="ready"
+        )
+
+    @router.post(
+        "/{session_id}/execute",
+        response_model=ExecuteCellResponse,
+        operation_id="execute_notebook_cell",
+        summary="Execute a notebook cell",
+        description="Execute a single cell in the given session. Optionally override the cell source. "
+        "Updates the .ipynb file in place after execution.",
+        include_in_schema=False,
+    )
     async def execute_cell(session_id: str, req: ExecuteCellRequest):
+
+
         session = _sessions.get(session_id)
         if not session:
-            raise HTTPException(404, "Session not found")
+            raise HTTPException(status_code=404, detail="Session not found")
         if session.busy:
-            raise HTTPException(409, "Cell already executing")
-        if not 0 <= req.cell_index < len(session.nb.cells):
-            raise HTTPException(400, "Cell index out of range")
-        cell = session.nb.cells[req.cell_index]
-        previous_source = cell.source
+            raise HTTPException(status_code=409, detail="Cell already executing")
+
+        nb = session.nb
+        if req.cell_index < 0 or req.cell_index >= len(nb.cells):
+            raise HTTPException(
+                status_code=400,
+                detail=f"cell_index {req.cell_index} out of range (0..{len(nb.cells) - 1})",
+            )
+
+        cell = nb.cells[req.cell_index]
         if req.source is not None:
             cell.source = req.source
-        if len(nbformat.writes(session.nb).encode()) > 2 * MAX_RESPONSE_BYTES:
-            cell.source = previous_source
-            raise ResourceLimitError("Notebook exceeds the session size limit.")
+
         session.busy = True
         session.last_used = time.time()
-        session.client.output_bytes = sum(len(json.dumps(c.get("outputs", [])).encode()) for i, c in enumerate(session.nb.cells) if i != req.cell_index)
+
         try:
-            async with asyncio.timeout(130):
-                await session.client.async_execute_cell(cell, req.cell_index)
+            await session.client.async_execute_cell(cell, req.cell_index)
         except asyncio.CancelledError:
             await _destroy_session(session_id)
             raise
-        except CellExecutionError:
-            return ExecuteCellResponse(status="error", execution_count=cell.get("execution_count"), outputs=cell.get("outputs", []))
-        except Exception as exc:
-            # Errors may leave a kernel running or an IOPub queue filling.
-            await _destroy_session(session_id)
-            return ExecuteCellResponse(status="error", outputs=[{
-                "output_type": "error", "ename": type(exc).__name__,
-                "evalue": str(exc)[:1000], "traceback": [str(exc)[:1000]],
-            }])
+        except Exception as e:
+            # Return the error as a cell output rather than HTTP error
+            return ExecuteCellResponse(
+                status="error",
+                outputs=[
+                    {
+                        "output_type": "error",
+                        "ename": type(e).__name__,
+                        "evalue": str(e),
+                        "traceback": [str(e)],
+                    }
+                ],
+            )
+
         finally:
             session.busy = False
-            session.last_used = time.time()
-        try:
-            async with aiofiles.open(session.path, "w", encoding="utf-8") as target:
-                await target.write(nbformat.writes(session.nb))
-        except OSError:
-            pass
-        return ExecuteCellResponse(status="ok", execution_count=cell.get("execution_count"), outputs=cell.get("outputs", []))
+        session.last_used = time.time()
 
-    @router.get("/{session_id}", response_model=SessionStatusResponse, operation_id="get_notebook_session", include_in_schema=False)
+        # Serialize outputs
+        outputs = []
+        for o in cell.outputs:
+            od = dict(o)
+            if "data" in od:
+                od["data"] = dict(od["data"])
+            outputs.append(od)
+
+        ec = cell.get("execution_count")
+
+        # Save notebook to disk
+        try:
+            nb_json = nbformat.writes(nb)
+            async with aiofiles.open(session.path, "w", encoding="utf-8") as f:
+                await f.write(nb_json)
+        except Exception:
+            pass  # non-fatal
+
+        return ExecuteCellResponse(
+            status="ok", execution_count=ec, outputs=outputs
+        )
+
+    @router.get(
+        "/{session_id}",
+        response_model=SessionStatusResponse,
+        operation_id="get_notebook_session",
+        summary="Get notebook session status",
+        include_in_schema=False,
+    )
     async def get_session(session_id: str):
         session = _sessions.get(session_id)
         if not session:
-            raise HTTPException(404, "Session not found")
-        return SessionStatusResponse(id=session.id, path=session.path,
-            kernel=session.nb.metadata.get("kernelspec", {}).get("name", "python3"), status="busy" if session.busy else "ready")
+            raise HTTPException(status_code=404, detail="Session not found")
 
-    @router.delete("/{session_id}", operation_id="delete_notebook_session", include_in_schema=False)
+        kernel_name = session.nb.metadata.get("kernelspec", {}).get(
+            "name", "python3"
+        )
+        status = "busy" if session.busy else "ready"
+        return SessionStatusResponse(
+            id=session.id, path=session.path, kernel=kernel_name, status=status
+        )
+
+    @router.delete(
+        "/{session_id}",
+        operation_id="delete_notebook_session",
+        summary="Stop a notebook session",
+        include_in_schema=False,
+    )
     async def delete_session(session_id: str):
         if session_id not in _sessions:
-            raise HTTPException(404, "Session not found")
+            raise HTTPException(status_code=404, detail="Session not found")
         await _destroy_session(session_id)
         return {"status": "stopped"}
 

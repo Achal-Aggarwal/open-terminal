@@ -152,62 +152,16 @@ You can also point to a specific config file:
 open-terminal run --config /path/to/my-config.toml
 ```
 
-### Memory and execution budgets
+### Memory management
 
-File downloads and proxy traffic stream in chunks. Uploads and generated ZIP/PDF
-files use temporary files, removed on completion or cancellation. Command logs
-rotate on disk without reading the whole log into memory.
+File and command-output responses stream from disk, uploads are copied in chunks,
+and generated ZIP/PDF files are removed after sending or cancellation. Log rotation
+keeps the original newest-half behavior without loading the entire log into memory.
+Search listings and ranking use temporary disk storage while preserving full matches.
 
-Text reads preserve the original `path`, `total_lines`, and `content` response,
-including complete long lines and the requested line range. The response is
-built on disk and streamed, without loading the entire source into a list of
-lines. Log reads return bounded pages; continue from `next_offset` when
-`truncated` is true. Explicit log `tail` reads return the newest output and can
-skip older entries.
-
-These settings accept positive integers, through TOML keys or the corresponding
-`OPEN_TERMINAL_` environment variable (for example, `OPEN_TERMINAL_MAX_RESPONSE_BYTES`):
-
-| TOML key | Default | Scope |
-|---|---:|---|
-| `max_response_bytes` | 1048576 | Log content per page and notebook output budget |
-| `max_request_bytes` | 2097152 | HTTP request bodies outside file/skill APIs |
-| `max_transfer_bytes` | 1073741824 | Proxy request bodies |
-| `max_command_seconds` | 3600 | Background command lifetime; separate from the output wait timeout |
-
-Commands, notebook sessions, and HTTP requests have no global concurrency cap.
-Outside file/skill APIs, oversized inputs return 413 and JSON bodies are
-checked for excessive nesting/object counts before parsing. Background commands that exceed their deadline stop with an
-`error` in their status response. Log I/O failures are reported there too; output
-is still drained and the command's completion state is finalized.
-
-Searches preserve complete matching lines, ignore rules, ranking, and pagination.
-Git/ripgrep listings and ranked content matches use temporary disk storage rather
-than collecting the whole search in memory. File reads, edits, uploads, archives,
-and document extraction have no added size, line-count, cell-count, or scan caps.
-Document extraction writes text to a temporary file in a separate worker, with
-cleanup on completion or cancellation. File comparison retains its pre-existing
-50 MiB input, 2 million characters, 50,000 lines, and 60-second limits.
-
-Notebook kernels are stopped on cancelled execution, excessive output, or failed
-startup, and idle sessions expire after 30 minutes. Ordinary Python cell errors
-preserve the session. Unattached terminals expire after 60 seconds; connected
-terminals remain available until they disconnect, exit, or are deleted. Terminal
-I/O uses backpressure; Open Terminal does not override Uvicorn's WebSocket message
-size or queue settings.
-
-Arbitrary shell/notebook code needs OS-level isolation to keep its allocations
-from exhausting the API container. On Linux, `OPEN_TERMINAL_WORKLOAD_CGROUP` can
-point to an existing, writable cgroup v2 directory with a finite `memory.max`.
-Launched commands, terminals, kernels, and document workers join that group
-before executing; keep the API outside it. Configure an aggregate memory budget
-that leaves room for the API, plus `pids.max` and `memory.swap.max` as appropriate.
-The host/container supervisor must delegate that cgroup and grant access to the
-worker users; Open Terminal does not create or modify host cgroups. Without it,
-application budgets do **not** bound arbitrary child allocations or forks.
-A memory limit on the entire container alone can still kill the API.
-Hard workload memory isolation requires support from the deployment platform;
-application streaming and cleanup cannot constrain arbitrary user programs.
+Process, terminal, notebook, and document-worker cleanup releases readers, file
+handles, and child processes on completion, cancellation, or server shutdown.
+The existing command-log retention and notebook idle timeout still apply.
 
 ### File Browser Root
 

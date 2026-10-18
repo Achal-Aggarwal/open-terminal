@@ -1,32 +1,11 @@
-"""Memory budgets shared by HTTP handlers and subprocess workers."""
+"""Streaming I/O helpers with cancellation-safe resource cleanup."""
 
 import asyncio
 import os
-from pathlib import Path
-import sys
 
 from fastapi import HTTPException
-from starlette.responses import JSONResponse
-
-from open_terminal import config
-
-
-def positive_setting(name: str, default: int) -> int:
-    value = int(os.environ.get(f"OPEN_TERMINAL_{name.upper()}", config.get(name, default)))
-    if value <= 0:
-        raise ValueError(f"OPEN_TERMINAL_{name.upper()} must be positive")
-    return value
-
 
 CHUNK_SIZE = 64 * 1024
-MAX_RESPONSE_BYTES = positive_setting("max_response_bytes", 1024 * 1024)
-MAX_REQUEST_BYTES = positive_setting("max_request_bytes", 2 * 1024 * 1024)
-MAX_TRANSFER_BYTES = positive_setting("max_transfer_bytes", 1024 * 1024 * 1024)
-MAX_COMMAND_SECONDS = positive_setting("max_command_seconds", 3600)
-
-
-class ResourceLimitError(ValueError):
-    pass
 
 
 async def run_io(function, *args):
@@ -42,7 +21,7 @@ async def run_io(function, *args):
         raise
 
 
-class ResourceLimitsMiddleware:
+class NormalizeNullQueryMiddleware:
     def __init__(self, app):
         self.app = app
 
@@ -53,67 +32,7 @@ class ResourceLimitsMiddleware:
             cleaned = [(key, value) for key, value in params if value.lower() != "null"]
             if len(cleaned) != len(params):
                 scope = {**scope, "query_string": urlencode(cleaned).encode()}
-        if scope["type"] != "http" or (scope["path"] == "/health" or scope["path"].startswith(("/files/", "/skills"))):
-            return await self.app(scope, receive, send)
-        limit = MAX_TRANSFER_BYTES if scope["path"] == "/files/upload" or scope["path"].startswith("/proxy/") else MAX_REQUEST_BYTES
-        headers = dict(scope.get("headers", []))
-        try:
-            size = int(headers.get(b"content-length", b"0"))
-        except ValueError:
-            size = limit + 1
-        if size < 0 or size > limit:
-            return await JSONResponse({"detail": "Request body exceeds the size limit."}, status_code=413)(scope, receive, send)
-        received = 0
-        quoted = escaped = False
-        depth = tokens = 0
-        is_json = limit == MAX_REQUEST_BYTES
-
-        async def limited_receive():
-            nonlocal received, quoted, escaped, depth, tokens
-            message = await receive()
-            body = message.get("body", b"")
-            received += len(body)
-            if received > limit:
-                raise HTTPException(413, "Request body exceeds the size limit.")
-            if is_json:
-                # Check structure before json.loads can expand a small body into
-                # hundreds of thousands of dicts/lists. String contents are free.
-                for byte in body:
-                    if quoted:
-                        if escaped:
-                            escaped = False
-                        elif byte == 92:
-                            escaped = True
-                        elif byte == 34:
-                            quoted = False
-                    elif byte == 34:
-                        quoted = True
-                    elif byte in (123, 91):
-                        depth += 1
-                        tokens += 1
-                    elif byte in (125, 93):
-                        depth -= 1
-                    elif byte in (44, 58):
-                        tokens += 1
-                    if depth > 64 or tokens > 10_000:
-                        raise HTTPException(413, "JSON structure exceeds the complexity limit.")
-            return message
-
-        await self.app(scope, limited_receive, send)
-
-
-def worker_command(command: list[str]) -> list[str]:
-    """Join the configured workload cgroup before exec, without preexec_fn."""
-    if os.name == "nt":
-        return command
-    cgroup = os.environ.get("OPEN_TERMINAL_WORKLOAD_CGROUP", "")
-    if cgroup:
-        path = Path(cgroup)
-        if (path / "memory.max").read_text().strip() == "max":
-            raise ValueError("OPEN_TERMINAL_WORKLOAD_CGROUP must have a finite memory.max")
-    if not cgroup:
-        return command
-    return [sys.executable, str(Path(__file__).with_name("worker.py")), cgroup, *command]
+        await self.app(scope, receive, send)
 
 
 async def run_worker(command, payload=None, *, request=None, timeout=60, **options):
@@ -121,13 +40,10 @@ async def run_worker(command, payload=None, *, request=None, timeout=60, **optio
     import signal
     import subprocess
 
-    worker_env = dict(options.pop("env", os.environ))
-    # Document extraction does not need BLAS parallelism.
-    worker_env.update(OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", MALLOC_ARENA_MAX="2")
     process = await asyncio.create_subprocess_exec(
-        *worker_command(command), stdin=asyncio.subprocess.PIPE,
+        *command, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=subprocess.DEVNULL,
-        start_new_session=os.name != "nt", env=worker_env, **options,
+        start_new_session=os.name != "nt", **options,
     )
 
     async def exchange():

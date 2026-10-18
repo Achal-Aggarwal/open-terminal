@@ -27,7 +27,20 @@ from starlette.responses import FileResponse
 from open_terminal.utils.limits import CHUNK_SIZE, run_io
 
 
-class TemporaryFileResponse(FileResponse):
+class FullFileResponse(FileResponse):
+    """Stream the original full response without adding HTTP range/cache semantics."""
+
+    def set_stat_headers(self, stat_result):
+        self.headers.setdefault("content-length", str(stat_result.st_size))
+
+    async def __call__(self, scope, receive, send):
+        if "accept-ranges" in self.headers:
+            del self.headers["accept-ranges"]
+        scope = {**scope, "headers": [(key, value) for key, value in scope.get("headers", []) if key.lower() not in (b"range", b"if-range")]}
+        await super().__call__(scope, receive, send)
+
+
+class TemporaryFileResponse(FullFileResponse):
     """Remove generated files even when sending the response is cancelled."""
 
     async def __call__(self, scope, receive, send):
@@ -257,10 +270,6 @@ class UserFS:
         async with aiofiles.open(path, "r", encoding=encoding, errors="strict") as f:
             return await f.read()
 
-    async def read_lines(self, path, start_line=None, end_line=None):
-        self._check_path(path)
-        return await run_io(read_text_range, path, start_line, end_line)
-
     async def exists(self, path: str) -> bool:
         """Check if *path* exists."""
         self._check_path(path)
@@ -309,11 +318,7 @@ class UserFS:
         self._check_path(path)
         def _list_sync():
             entries = []
-            with os.scandir(path) as scan:
-                names = []
-                for entry in scan:
-                    names.append(entry.name)
-            for name in sorted(names):
+            for name in sorted(os.listdir(path)):
                 full = os.path.join(path, name)
                 if not self.is_path_allowed(full):
                     continue
@@ -339,15 +344,20 @@ class UserFS:
         """
         self._check_path(path)
         def _walk_filtered():
-            from open_terminal.utils.search import walk_entries
-            directories = {path: ([], [])}
-            for full, kind in walk_entries(self, path):
-                parent = os.path.dirname(full)
-                dirs, files = directories.setdefault(parent, ([], []))
-                (dirs if kind == "directory" else files).append(os.path.basename(full))
-                if kind == "directory":
-                    directories.setdefault(full, ([], []))
-            return [(directory, dirs, files) for directory, (dirs, files) in directories.items()]
+            result = []
+            for dirpath, dirnames, filenames in os.walk(path):
+                # Prune directories belonging to other users (in-place
+                # modification prevents os.walk from descending into them).
+                dirnames[:] = [
+                    d for d in dirnames
+                    if self.is_path_allowed(os.path.join(dirpath, d))
+                ]
+                filenames = [
+                    f for f in filenames
+                    if self.is_path_allowed(os.path.join(dirpath, f))
+                ]
+                result.append((dirpath, dirnames, filenames))
+            return result
         return await run_io(_walk_filtered)
 
     # ------------------------------------------------------------------

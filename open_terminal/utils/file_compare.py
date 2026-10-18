@@ -105,7 +105,7 @@ def extract(path):
                 raise ValueError("Unsupported binary file.")
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         if len(text) > MAX_TEXT_CHARS:
-            raise ValueError("Extracted text exceeds the comparison limit.")
+            raise ValueError("Extracted text exceeds the comparison limit (2 million characters / 50,000 lines). Nothing was truncated.")
         line_breaks = "\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
         line_count = sum(1 for _ in re.finditer("[" + line_breaks + "]", text)) + bool(text and text[-1] not in line_breaks)
         if line_count > MAX_LINES:
@@ -232,11 +232,19 @@ async def run_comparison(request, payload, fs, cwd=None):
             }
         else:
             command = ["sudo", "-n", "-u", fs.username, "--", *command]
-    stdout = await run_worker(
-        command,
-        json.dumps({"original": paths[0], "revised": paths[1], "ignore_whitespace": payload.ignore_whitespace}).encode(),
-        request=request, timeout=TIMEOUT_SECONDS, **process_options,
-    )
+    try:
+        stdout = await run_worker(
+            command,
+            json.dumps({"original": paths[0], "revised": paths[1], "ignore_whitespace": payload.ignore_whitespace}).encode(),
+            request=request, timeout=TIMEOUT_SECONDS, **process_options,
+        )
+    except HTTPException as exc:
+        messages = {
+            408: "Comparison exceeded the 60 second limit. Try smaller files.",
+            422: "Comparison failed. Check that the document libraries are installed and the files are readable.",
+            499: "Comparison cancelled.",
+        }
+        raise HTTPException(exc.status_code, messages.get(exc.status_code, exc.detail)) from exc
     result = json.loads(stdout)
     if "error" in result:
         raise HTTPException(422, result["error"])
