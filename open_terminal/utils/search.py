@@ -63,6 +63,8 @@ def search_entries(fs, root, show_hidden=False):
                 if not show_hidden and any(part.startswith(".") for part in rel.replace("\\", "/").split("/")):
                     continue
                 path = os.path.normpath(os.path.join(root, rel))
+                if not fs.is_path_allowed(path):
+                    continue
                 while path != root and path.startswith(root.rstrip(os.sep) + os.sep):
                     if fs.is_path_allowed(path):
                         cursor = db.execute("INSERT OR IGNORE INTO entries VALUES (?)", (os.fsencode(path),))

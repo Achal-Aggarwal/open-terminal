@@ -1141,7 +1141,10 @@ async def match_files(
         query_lower = query.lower()
 
         def content_lines(path):
-            with open(path, encoding="utf-8", errors="replace") as source:
+            with open(path, encoding="utf-8", errors="replace", newline="\n" if rg_matches is not None else None) as source:
+                if rg_matches is not None:
+                    yield from enumerate(source, 1)
+                    return
                 number = 0
                 for line in source:
                     for text in line.splitlines():
