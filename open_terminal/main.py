@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner, read_pty, write_pty, PtyRunner
 from open_terminal.utils.fs import UserFS, TemporaryFileResponse, read_text_range
-from open_terminal.utils.limits import (CHUNK_SIZE, MAX_RESPONSE_BYTES, MAX_TRANSFER_BYTES, MAX_PROCESSES, MAX_SEARCH_ENTRIES, MAX_SEARCH_BYTES, ResourceLimitError, ResourceLimitsMiddleware, run_io, run_worker, worker_command)
+from open_terminal.utils.limits import (CHUNK_SIZE, MAX_RESPONSE_BYTES, MAX_TRANSFER_BYTES, MAX_SEARCH_ENTRIES, MAX_SEARCH_BYTES, ResourceLimitError, ResourceLimitsMiddleware, run_io, run_worker, worker_command)
 from open_terminal.utils.file_compare import CompareRequest, run_comparison
 from open_terminal.utils.search import search_entries, walk_entries, text_lines, snippet
 from open_terminal.utils.skills import join_skill_path, list_skill_resources, parse_skill_frontmatter
@@ -385,7 +385,6 @@ class BackgroundProcess:
 
 
 _processes: dict[str, BackgroundProcess] = {}
-_starting_processes = 0
 _EXPIRY_SECONDS = 300  # auto-clean finished processes after 5 min
 
 
@@ -1520,21 +1519,14 @@ async def execute(
         ge=1,
     ),
 ):
-    global _starting_processes
     _cleanup_expired()
-    if sum(p.finished_at is None for p in _processes.values()) + _starting_processes >= MAX_PROCESSES:
-        raise HTTPException(429, "Maximum active commands reached; stop a command or retry later.")
     fs = get_filesystem(http_request)
     session_id = http_request.headers.get("x-session-id")
     session_cwd = _get_session_cwd(session_id, fs) if session_id else None
     cwd = fs.resolve_path(request.cwd, cwd=session_cwd) if request.cwd else (session_cwd or fs.home)
 
     subprocess_env = {**os.environ, **request.env} if request.env else None
-    _starting_processes += 1
-    try:
-        runner = await create_runner(request.command, cwd, subprocess_env, run_as_user=fs.username)
-    finally:
-        _starting_processes -= 1
+    runner = await create_runner(request.command, cwd, subprocess_env, run_as_user=fs.username)
 
     process_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     log_path = os.path.join(LOG_DIR, "processes", f"{process_id}.jsonl")

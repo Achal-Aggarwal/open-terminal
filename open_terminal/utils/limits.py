@@ -23,9 +23,6 @@ CHUNK_SIZE = 64 * 1024
 MAX_RESPONSE_BYTES = positive_setting("max_response_bytes", 1024 * 1024)
 MAX_REQUEST_BYTES = positive_setting("max_request_bytes", 2 * 1024 * 1024)
 MAX_TRANSFER_BYTES = positive_setting("max_transfer_bytes", 1024 * 1024 * 1024)
-MAX_CONCURRENT_REQUESTS = positive_setting("max_concurrent_requests", 8)
-MAX_PROCESSES = positive_setting("max_processes", 8)
-MAX_NOTEBOOKS = positive_setting("max_notebooks", 2)
 MAX_COMMAND_SECONDS = positive_setting("max_command_seconds", 3600)
 WORKER_MEMORY_BYTES = positive_setting("worker_memory_bytes", 512 * 1024 * 1024)
 MAX_SEARCH_ENTRIES = 10_000
@@ -77,7 +74,6 @@ async def run_io(function, *args):
 class ResourceLimitsMiddleware:
     def __init__(self, app):
         self.app = app
-        self.capacity = Capacity(MAX_CONCURRENT_REQUESTS)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
@@ -96,8 +92,6 @@ class ResourceLimitsMiddleware:
             size = limit + 1
         if size < 0 or size > limit:
             return await JSONResponse({"detail": "Request body exceeds the size limit."}, status_code=413)(scope, receive, send)
-        if self.capacity.active >= self.capacity.limit:
-            return await JSONResponse({"detail": "Too many active requests."}, status_code=429)(scope, receive, send)
         received = 0
         quoted = escaped = False
         depth = tokens = 0
@@ -134,8 +128,7 @@ class ResourceLimitsMiddleware:
                         raise HTTPException(413, "JSON structure exceeds the complexity limit.")
             return message
 
-        with self.capacity.acquire():
-            await self.app(scope, limited_receive, send)
+        await self.app(scope, limited_receive, send)
 
 
 def worker_command(command: list[str], *, memory_limit: int = 0) -> list[str]:

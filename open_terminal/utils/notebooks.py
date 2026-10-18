@@ -16,11 +16,10 @@ import zmq
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from open_terminal.utils.limits import MAX_NOTEBOOKS, MAX_RESPONSE_BYTES, ResourceLimitError, worker_command
+from open_terminal.utils.limits import MAX_RESPONSE_BYTES, ResourceLimitError, worker_command
 
 _IDLE_TIMEOUT = 30 * 60
 _sessions = {}
-_starting_sessions = 0
 _cleanup_task = None
 
 
@@ -138,10 +137,6 @@ def create_notebooks_router(verify_api_key):
 
     @router.post("", response_model=CreateSessionResponse, operation_id="create_notebook_session", include_in_schema=False)
     async def create_session(req: CreateSessionRequest):
-        global _starting_sessions
-        if len(_sessions) + _starting_sessions >= MAX_NOTEBOOKS:
-            raise HTTPException(429, "Maximum notebook sessions reached; stop a session first.")
-        _starting_sessions += 1
         client = None
         registered = False
         try:
@@ -176,7 +171,6 @@ def create_notebooks_router(verify_api_key):
             registered = True
             return CreateSessionResponse(id=sid, kernel=kernel_name, status="ready")
         finally:
-            _starting_sessions -= 1
             if client and not registered:
                 await _close_client(client)
 
