@@ -35,10 +35,10 @@ from pydantic import BaseModel, Field
 
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner, read_pty, write_pty, PtyRunner
-from open_terminal.utils.fs import UserFS, TemporaryFileResponse, read_text_range
-from open_terminal.utils.limits import (CHUNK_SIZE, MAX_RESPONSE_BYTES, MAX_TRANSFER_BYTES, MAX_SEARCH_ENTRIES, MAX_SEARCH_BYTES, ResourceLimitError, ResourceLimitsMiddleware, run_io, run_worker, worker_command)
+from open_terminal.utils.fs import UserFS, TemporaryFileResponse, text_file_response
+from open_terminal.utils.limits import (CHUNK_SIZE, ResourceLimitError, ResourceLimitsMiddleware, run_io, run_worker, worker_command)
 from open_terminal.utils.file_compare import CompareRequest, run_comparison
-from open_terminal.utils.search import search_entries, walk_entries, text_lines, snippet
+from open_terminal.utils.search import search_entries, walk_entries, matching_files, ranked_page
 from open_terminal.utils.skills import join_skill_path, list_skill_resources, parse_skill_frontmatter
 
 MATCH_PAGE_SIZE = 100
@@ -297,7 +297,7 @@ class WriteRequest(BaseModel):
 
 class ReplacementChunk(BaseModel):
     target: str = Field(
-        ..., min_length=1,
+        ...,
         description="Exact string to find. Must match precisely, including whitespace.",
     )
     replacement: str = Field(
@@ -344,7 +344,7 @@ class ReplaceRequest(BaseModel):
         description="Path to the file to modify.",
     )
     replacements: list[ReplacementChunk] = Field(
-        ..., max_length=100,
+        ...,
         description="List of find-and-replace operations to apply sequentially.",
     )
 
@@ -552,7 +552,6 @@ async def _list_skills_in_dir(fs: UserFS, root: str, scope: str) -> list[SkillSu
         return []
 
     skills: list[SkillSummary] = []
-    response_bytes = 0
     for entry in await fs.listdir(root):
         dirname = str(entry.get("name") or "")
         if entry.get("type") != "directory" or not dirname or dirname.startswith("."):
@@ -575,9 +574,6 @@ async def _list_skills_in_dir(fs: UserFS, root: str, scope: str) -> list[SkillSu
             location=skill_path,
             scope=scope,
         )
-        response_bytes += len(skill.model_dump_json().encode())
-        if response_bytes > MAX_RESPONSE_BYTES:
-            raise ResourceLimitError("Skill listing exceeds the response size limit.")
         skills.append(skill)
     return skills
 
@@ -639,7 +635,6 @@ async def list_skills(
     seen_names: set[str] = set()
     seen_roots: set[str] = set()
     skills: list[SkillSummary] = []
-    response_bytes = 0
 
     for scope, root in roots:
         root = os.path.normpath(root)
@@ -650,9 +645,6 @@ async def list_skills(
             if skill.name in seen_names:
                 continue
             seen_names.add(skill.name)
-            response_bytes += len(skill.model_dump_json().encode())
-            if response_bytes > MAX_RESPONSE_BYTES:
-                raise ResourceLimitError("Skill listing exceeds the response size limit.")
             skills.append(skill)
 
     return skills
@@ -747,32 +739,32 @@ async def read_file(
         raise HTTPException(status_code=404, detail="File not found")
 
     fs._check_path(target)
+    try:
+        return await run_io(text_file_response, target, target, start_line, end_line)
+    except UnicodeDecodeError:
+        pass
+
     import mimetypes
     from open_terminal.utils.documents import EXTRACTORS
 
     mime = mimetypes.guess_type(target)[0] or "application/octet-stream"
-    if any(mime.startswith(prefix) for prefix in BINARY_FILE_MIME_PREFIXES):
-        return FileResponse(target, media_type=mime)
     if any(kind and mime == kind or suffix and target.lower().endswith(suffix) for kind, suffix, _ in EXTRACTORS):
-        result = json.loads(await run_worker(
-            [sys.executable, "-m", "open_terminal.utils.documents"],
-            json.dumps({"path": target}).encode(), request=http_request,
-        ))
-        if "error" in result:
-            raise ResourceLimitError(result["error"])
-        # Extraction is bounded in the worker; use the same range/byte semantics.
         fd, extracted_path = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as extracted:
-                extracted.write(result["text"])
-            del result
-            return {"path": target, **await run_io(read_text_range, extracted_path, start_line, end_line)}
+            result = json.loads(await run_worker(
+                [sys.executable, "-m", "open_terminal.utils.documents"],
+                json.dumps({"path": target, "output": extracted_path}).encode(),
+                request=http_request, timeout=None,
+            ))
+            if "error" in result:
+                raise ValueError(result["error"])
+            return await run_io(text_file_response, extracted_path, target, start_line, end_line)
         finally:
             os.unlink(extracted_path)
-    try:
-        return {"path": target, **await fs.read_lines(target, start_line, end_line)}
-    except UnicodeDecodeError:
-        raise HTTPException(415, f"Unsupported binary file type: {mime}")
+    if any(mime.startswith(prefix) for prefix in BINARY_FILE_MIME_PREFIXES):
+        return FileResponse(target, media_type=mime)
+    raise HTTPException(415, f"Unsupported binary file type: {mime}")
 
 
 @app.get(
@@ -980,9 +972,6 @@ async def replace_file_content(http_request: Request, request: ReplaceRequest, f
                 detail=f"Found {count} occurrences of target string but allow_multiple is false",
             )
 
-        new_size = len(content.encode()) + count * (len(chunk.replacement.encode()) - len(chunk.target.encode()))
-        if new_size > MAX_RESPONSE_BYTES:
-            raise ResourceLimitError("Replacement would exceed the text editing size limit.")
         if chunk.start_line or chunk.end_line:
             new_region = search_region.replace(chunk.target, chunk.replacement)
             lines[start:end] = [new_region]
@@ -1054,44 +1043,51 @@ async def grep_search(
 
         matches = []
         truncated = False
-        scanned_bytes = 0
-        response_bytes = 0
 
         def _search_file(file_path: str):
-            nonlocal truncated, scanned_bytes, response_bytes
+            nonlocal truncated
+            if truncated:
+                return
             try:
-                scanned_bytes += os.path.getsize(file_path)
-                if scanned_bytes > MAX_SEARCH_BYTES:
-                    truncated = True
-                    return
-                for line_number, line in text_lines(file_path):
-                    match = pattern.search(line)
-                    if match:
-                        entry = {"file": file_path}
-                        if match_per_line:
-                            entry.update(line=line_number, content=snippet(line, match.start()))
-                        entry_size = len(json.dumps(entry).encode())
-                        if response_bytes + entry_size > MAX_RESPONSE_BYTES:
-                            truncated = True
-                            return
-                        response_bytes += entry_size
-                        matches.append(entry)
-                        if len(matches) >= max_results:
-                            truncated = True
-                            return
-                        if not match_per_line:
-                            return
-            except (UnicodeError, OSError):
-                pass
+                with open(file_path, "r", encoding="utf-8", errors="strict") as f:
+                    for line_number, line in enumerate(f, 1):
+                        if pattern.search(line):
+                            if match_per_line:
+                                matches.append(
+                                    {
+                                        "file": file_path,
+                                        "line": line_number,
+                                        "content": line.rstrip("\n\r"),
+                                    }
+                                )
+                                if len(matches) >= max_results:
+                                    truncated = True
+                                    return
+                            else:
+                                matches.append({"file": file_path})
+                                if len(matches) >= max_results:
+                                    truncated = True
+                                return  # one match per file is enough
+            except (UnicodeDecodeError, ValueError, OSError):
+                pass  # skip binary or unreadable files
 
-        fs._check_path(target)
         if os.path.isfile(target):
             _search_file(target)
         else:
-            for full, entry_type in walk_entries(fs, target):
+            for dirpath, dirnames, filenames in os.walk(target):
+                # Prune directories belonging to other users.
+                dirnames[:] = [
+                    d for d in dirnames
+                    if fs.is_path_allowed(os.path.join(dirpath, d))
+                ]
                 if truncated:
                     break
-                if entry_type == "file" and not os.path.islink(full) and _matches_include(os.path.basename(full)):
+                for filename in sorted(filenames):
+                    if not _matches_include(filename):
+                        continue
+                    full = os.path.join(dirpath, filename)
+                    if not fs.is_path_allowed(full):
+                        continue
                     _search_file(full)
 
         return matches, truncated
@@ -1122,7 +1118,7 @@ async def match_files(
     query: str = Query(..., description="Literal text to match."),
     path: str = Query(".", description="Directory to search within."),
     show_hidden: bool = Query(False, description="Include hidden dotfiles and dot-directories."),
-    offset: int = Query(0, description="Result offset (narrow the search beyond 1000 results).", ge=0, le=1000),
+    offset: int = Query(0, description="Result offset.", ge=0),
     limit: int = Query(
         MATCH_PAGE_SIZE,
         description="Maximum number of results to return.",
@@ -1143,11 +1139,16 @@ async def match_files(
 
     def _matches_sync():
         query_lower = query.lower()
-        scanned_bytes = 0
-        total = 0
+
+        def content_lines(path):
+            with open(path, encoding="utf-8", errors="replace") as source:
+                number = 0
+                for line in source:
+                    for text in line.splitlines():
+                        number += 1
+                        yield number, text
 
         def candidates():
-            nonlocal scanned_bytes, total
             for entry_path, entry_type in search_entries(fs, target, show_hidden):
                 rel_path = os.path.relpath(entry_path, target).replace("\\", "/")
                 name = os.path.basename(entry_path)
@@ -1158,28 +1159,28 @@ async def match_files(
                 if entry_type == "file" and not os.path.islink(entry_path):
                     try:
                         size = os.path.getsize(entry_path)
-                        if size <= MAX_CONTENT_SEARCH_FILE_SIZE:
-                            scanned_bytes += size
-                            if scanned_bytes > MAX_SEARCH_BYTES:
-                                raise ResourceLimitError("Content search exceeds the scan budget; narrow the path.")
-                            for number, text in text_lines(entry_path):
+                        eligible = rg_matches(entry_path) if rg_matches is not None else size <= MAX_CONTENT_SEARCH_FILE_SIZE
+                        if eligible:
+                            with open(entry_path, "rb") as source:
+                                if b"\0" in source.read(8192):
+                                    continue
+                            for number, text in content_lines(entry_path):
                                 index = text.lower().find(query_lower)
                                 if index >= 0:
-                                    content_matches.append({"line": number, "column": len(text[:index].encode("utf-16-le")) // 2 + 1, "text": snippet(text, index)})
+                                    content_matches.append({"line": number, "column": len(text[:index].encode("utf-16-le")) // 2 + 1, "text": text.rstrip("\r\n")})
                                     if len(content_matches) >= MAX_CONTENT_MATCHES_PER_FILE:
                                         break
                     except (OSError, UnicodeError):
                         pass
                 if score == 4 and not content_matches:
                     continue
-                total += 1
                 yield (score, len(rel_path), rel_lower, {
                     "path": entry_path, "relative_path": rel_path, "name": name,
                     "type": entry_type, "name_match": score < 4, "content_matches": content_matches,
                 })
 
-        matches = heapq.nsmallest(offset + limit, candidates(), key=lambda item: item[:3])
-        return {"results": [item[3] for item in matches[offset:]], "next_offset": offset + limit if total > offset + limit else None}
+        with matching_files(query, target, show_hidden) as rg_matches:
+            return ranked_page(candidates(), offset, limit)
 
     return await run_io(_matches_sync)
 
@@ -1275,23 +1276,58 @@ async def glob_search(
         matches = []
         truncated = False
 
-        for full_path, entry_type in walk_entries(fs, target):
-            if type != "any" and type != entry_type:
-                continue
-            name = os.path.basename(full_path)
-            rel_path = os.path.relpath(full_path, target)
-            if not fnmatch.fnmatch(name, pattern) and not fnmatch.fnmatch(rel_path, pattern):
-                continue
-            if exclude and any(fnmatch.fnmatch(name, item) or fnmatch.fnmatch(rel_path, item) for item in exclude):
-                continue
-            try:
-                info = os.stat(full_path)
-                matches.append({"path": rel_path, "type": entry_type, "size": info.st_size, "modified": info.st_mtime})
-            except OSError:
-                continue
-            if len(matches) >= max_results:
-                truncated = True
+        for dirpath, dirnames, filenames in os.walk(target):
+            if truncated:
                 break
+
+            # Prune directories belonging to other users.
+            dirnames[:] = [
+                d for d in dirnames
+                if fs.is_path_allowed(os.path.join(dirpath, d))
+            ]
+
+            entries = []
+            if type in ("any", "directory"):
+                entries.extend([(d, "directory") for d in dirnames])
+            if type in ("any", "file"):
+                entries.extend([(f, "file") for f in filenames])
+
+            for name, entry_type in sorted(entries, key=lambda x: x[0]):
+                if truncated:
+                    break
+
+                full_path = os.path.join(dirpath, name)
+                rel_path = os.path.relpath(full_path, target)
+
+                # Check inclusion pattern
+                if not fnmatch.fnmatch(name, pattern) and not fnmatch.fnmatch(
+                    rel_path, pattern
+                ):
+                    continue
+
+                # Check exclusion patterns
+                if exclude and any(
+                    fnmatch.fnmatch(name, excl) or fnmatch.fnmatch(rel_path, excl)
+                    for excl in exclude
+                ):
+                    continue
+
+                try:
+                    file_stat = os.stat(full_path)
+                    matches.append(
+                        {
+                            "path": rel_path,
+                            "type": entry_type,
+                            "size": file_stat.st_size,
+                            "modified": file_stat.st_mtime,
+                        }
+                    )
+
+                    if len(matches) >= max_results:
+                        truncated = True
+                        break
+                except OSError:
+                    pass
 
         return matches, truncated
 
@@ -1317,22 +1353,6 @@ class UploadParser(MultiPartParser):
                 file.close()
             raise
 
-    def on_part_begin(self):
-        self._header_bytes = 0
-        super().on_part_begin()
-
-    def _check_header(self, start, end):
-        self._header_bytes += end - start
-        if self._header_bytes > 16 * 1024:
-            raise MultiPartException("Upload headers exceed the size limit.")
-
-    def on_header_field(self, data, start, end):
-        self._check_header(start, end)
-        super().on_header_field(data, start, end)
-
-    def on_header_value(self, data, start, end):
-        self._check_header(start, end)
-        super().on_header_value(data, start, end)
 
 
 @app.post(
@@ -1352,7 +1372,7 @@ async def upload_file(
     fs: UserFS = Depends(get_filesystem),
 ):
     try:
-        form = await UploadParser(http_request.headers, http_request.stream(), max_files=1, max_fields=0).parse()
+        form = await UploadParser(http_request.headers, http_request.stream()).parse()
     except MultiPartException as exc:
         raise HTTPException(400, exc.message) from None
     file = form.get("file")
@@ -1372,8 +1392,6 @@ async def upload_file(
         async with aiofiles.open(temporary, "wb") as output:
             while chunk := await file.read(CHUNK_SIZE):
                 size += len(chunk)
-                if size > MAX_TRANSFER_BYTES:
-                    raise ResourceLimitError("Upload exceeds the transfer size limit.")
                 await output.write(chunk)
         await fs._chown(temporary)
         await aiofiles.os.replace(temporary, path)
@@ -1389,7 +1407,7 @@ async def upload_file(
 
 class ArchiveRequest(BaseModel):
     paths: list[str] = Field(
-        ..., max_length=100,
+        ...,
         description="List of file or directory paths to include in the ZIP archive.",
     )
 
@@ -1427,28 +1445,20 @@ async def archive_paths(
     stop = threading.Event()
 
     def _build_zip():
-        count = 0
-        total = 0
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
             for target in resolved:
                 fs._check_path(target)
                 entries = [(target, "file")] if os.path.isfile(target) else walk_entries(fs, target)
                 for full, entry_type in entries:
-                    if entry_type != "file" or os.path.islink(full):
+                    if entry_type != "file":
                         continue
                     if stop.is_set():
                         return
-                    count += 1
-                    if count > MAX_SEARCH_ENTRIES:
-                        raise ResourceLimitError("Archive contains too many files.")
                     arcname = os.path.basename(full) if full == target else os.path.join(os.path.basename(target.rstrip("/\\")) or "dir", os.path.relpath(full, target))
                     with open(full, "rb") as source, archive.open(arcname, "w") as destination:
                         while chunk := source.read(CHUNK_SIZE):
                             if stop.is_set():
                                 return
-                            total += len(chunk)
-                            if total > MAX_TRANSFER_BYTES:
-                                raise ResourceLimitError("Archive exceeds the transfer size limit.")
                             destination.write(chunk)
 
     task = asyncio.create_task(asyncio.to_thread(_build_zip))

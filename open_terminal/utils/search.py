@@ -1,93 +1,110 @@
-"""Bounded directory traversal and text snippets for file searches."""
+"""Incremental filesystem searches with disk-backed Git and ripgrep results."""
+from contextlib import contextmanager
+import json
 import os
+import shutil
+import sqlite3
 import subprocess
-import threading
+import tempfile
 
-from open_terminal.utils.limits import CHUNK_SIZE, MAX_SEARCH_ENTRIES, ResourceLimitError
+from open_terminal.utils.limits import CHUNK_SIZE
 
 
 def walk_entries(fs, root, show_hidden=True):
-    """Yield at most the scan budget; never materialize an unlimited directory."""
-    count = 0
-    stack = [root]
-    while stack:
-        directory = stack.pop()
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                if not show_hidden and entry.name.startswith(".") or not fs.is_path_allowed(entry.path):
-                    continue
-                count += 1
-                if count > MAX_SEARCH_ENTRIES:
-                    raise ResourceLimitError("Directory tree exceeds the search limit; narrow the path.")
-                is_dir = entry.is_dir(follow_symlinks=False)
-                yield entry.path, "directory" if is_dir else "file"
-                if is_dir:
-                    stack.append(entry.path)
+    for directory, dirs, files in os.walk(root):
+        dirs[:] = [name for name in sorted(dirs)
+                   if (show_hidden or not name.startswith("."))
+                   and fs.is_path_allowed(os.path.join(directory, name))]
+        for name, kind in sorted([(name, "directory") for name in dirs] + [(name, "file") for name in files]):
+            path = os.path.join(directory, name)
+            if (show_hidden or not name.startswith(".")) and fs.is_path_allowed(path):
+                yield path, kind
+
+
+def _nul_records(source):
+    pending = b""
+    while chunk := source.read(CHUNK_SIZE):
+        records = (pending + chunk).split(b"\0")
+        pending = records.pop()
+        yield from records
+    if pending:
+        yield pending
+
+
+@contextmanager
+def disk_database():
+    with tempfile.TemporaryDirectory() as directory:
+        db = sqlite3.connect(os.path.join(directory, "search.sqlite"))
+        try:
+            db.execute("PRAGMA cache_size = -1024")
+            db.execute("PRAGMA temp_store = FILE")
+            yield db
+        finally:
+            db.close()
 
 
 def search_entries(fs, root, show_hidden=False):
-    """Honor git ignores when available, with bounded subprocess output."""
-    try:
-        process = subprocess.Popen(
-            ["git", "-C", root, "ls-files", "-co", "--exclude-standard", "-z", "--", "."],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        )
-    except OSError:
-        yield from walk_entries(fs, root, show_hidden)
+    with tempfile.TemporaryFile() as output:
+        try:
+            result = subprocess.run(
+                ["git", "-C", root, "ls-files", "-co", "--exclude-standard", "-z", "--", "."],
+                stdout=output, stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            result = None
+        if result is None or result.returncode:
+            yield from walk_entries(fs, root, show_hidden)
+            return
+        output.seek(0)
+        with disk_database() as db:
+            db.execute("CREATE TABLE entries (path BLOB PRIMARY KEY)")
+            for raw in _nul_records(output):
+                rel = os.fsdecode(raw)
+                if not show_hidden and any(part.startswith(".") for part in rel.replace("\\", "/").split("/")):
+                    continue
+                path = os.path.normpath(os.path.join(root, rel))
+                while path != root and path.startswith(root.rstrip(os.sep) + os.sep):
+                    if fs.is_path_allowed(path):
+                        cursor = db.execute("INSERT OR IGNORE INTO entries VALUES (?)", (os.fsencode(path),))
+                        if cursor.rowcount:
+                            yield path, "directory" if os.path.isdir(path) else "file"
+                    path = os.path.dirname(path)
+
+
+@contextmanager
+def matching_files(query, root, show_hidden):
+    """Use rg's ignore rules without its potentially enormous JSON submatch arrays."""
+    rg = shutil.which("rg")
+    if not rg:
+        yield None
         return
-    deadline = threading.Timer(10, process.kill)
-    deadline.start()
-    try:
-        data = bytearray()
-        while chunk := process.stdout.read(CHUNK_SIZE):
-            if len(data) + len(chunk) > 2 * 1024 * 1024:
-                raise ResourceLimitError("Git file listing exceeds the search limit; narrow the path.")
-            data.extend(chunk)
-        process.wait(timeout=10)
-    finally:
-        deadline.cancel()
-        if process.poll() is None:
-            process.kill()
-        process.wait()
-        process.stdout.close()
-    if process.returncode:
-        yield from walk_entries(fs, root, show_hidden)
-        return
-    seen = set()
-    for raw in data.split(b"\0"):
-        if not raw:
-            continue
-        rel = os.fsdecode(bytes(raw))
-        if not show_hidden and any(part.startswith(".") for part in rel.replace("\\", "/").split("/")):
-            continue
-        path = os.path.normpath(os.path.join(root, rel))
-        candidates = [path]
-        parent = os.path.dirname(path)
-        while parent != root and parent.startswith(root + os.sep):
-            candidates.append(parent)
-            parent = os.path.dirname(parent)
-        for candidate in candidates:
-            if candidate in seen or not fs.is_path_allowed(candidate):
-                continue
-            seen.add(candidate)
-            if len(seen) > MAX_SEARCH_ENTRIES:
-                raise ResourceLimitError("Directory tree exceeds the search limit; narrow the path.")
-            yield candidate, "directory" if os.path.isdir(candidate) else "file"
+    with tempfile.TemporaryFile() as output:
+        args = [rg, "--files-with-matches", "--null", "--no-messages", "--fixed-strings", "--ignore-case"]
+        if show_hidden:
+            args.append("--hidden")
+        try:
+            result = subprocess.run([*args, "--", query, root], stdout=output, stderr=subprocess.DEVNULL)
+        except OSError:
+            result = None
+        if result is None or result.returncode not in (0, 1):
+            yield None
+            return
+        output.seek(0)
+        with disk_database() as db:
+            db.execute("CREATE TABLE matches (path BLOB PRIMARY KEY)")
+            db.executemany("INSERT OR IGNORE INTO matches VALUES (?)",
+                           ((os.fsencode(os.path.normpath(os.fsdecode(raw))),) for raw in _nul_records(output)))
+            yield lambda path: db.execute("SELECT 1 FROM matches WHERE path = ?", (os.fsencode(path),)).fetchone() is not None
 
 
-def text_lines(path):
-    with open(path, encoding="utf-8", errors="strict") as source:
-        number = 0
-        while line := source.readline(CHUNK_SIZE + 1):
-            number += 1
-            if len(line) > CHUNK_SIZE:
-                # Do not retain or search minified/oversized lines.
-                while line and not line.endswith("\n"):
-                    line = source.readline(CHUNK_SIZE + 1)
-                continue
-            yield number, line
-
-
-def snippet(text, index):
-    start = max(0, index - 120)
-    return text[start:start + 512].rstrip("\r\n")
+def ranked_page(candidates, offset, limit):
+    # Deep pagination must not keep offset + limit full-content matches in RAM.
+    with disk_database() as db:
+        db.execute("CREATE TABLE results (score INTEGER, length INTEGER, name TEXT, payload TEXT)")
+        total = 0
+        for score, length, name, result in candidates:
+            db.execute("INSERT INTO results VALUES (?, ?, ?, ?)", (score, length, name, json.dumps(result)))
+            total += 1
+        rows = db.execute("SELECT payload FROM results ORDER BY score, length, name, rowid LIMIT ? OFFSET ?", (limit, offset))
+        return {"results": [json.loads(row[0]) for row in rows],
+                "next_offset": offset + limit if total > offset + limit else None}

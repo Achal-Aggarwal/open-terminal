@@ -13,6 +13,10 @@ so that files belong to the provisioned user, not the server process.
 
 import asyncio
 import os
+import io
+import json
+import re
+import tempfile
 import shutil
 import subprocess
 
@@ -20,7 +24,7 @@ import aiofiles
 import aiofiles.os
 from starlette.responses import FileResponse
 
-from open_terminal.utils.limits import CHUNK_SIZE, MAX_RESPONSE_BYTES, MAX_SEARCH_ENTRIES, MAX_TEXT_LINES, ResourceLimitError, run_io
+from open_terminal.utils.limits import CHUNK_SIZE, run_io
 
 
 class TemporaryFileResponse(FileResponse):
@@ -36,30 +40,48 @@ class TemporaryFileResponse(FileResponse):
                 pass
 
 
+_LINE_BREAK = re.compile(r"[\n\v\f\x1c-\x1e\x85\u2028\u2029]")
+
+
+def text_chunks(source):
+    """Yield splitlines-compatible line numbers and bounded pieces of text."""
+    number = 1
+    for chunk in iter(lambda: source.read(CHUNK_SIZE), ""):
+        start = 0
+        for match in _LINE_BREAK.finditer(chunk):
+            end = match.end()
+            yield number, chunk[start:end]
+            number += 1
+            start = end
+        if start < len(chunk):
+            yield number, chunk[start:]
+
+
 def read_text_range(path, start_line=None, end_line=None):
-    selected = []
-    size = 0
+    selected = io.StringIO()
     total = 0
-    truncated = False
-    next_line = None
     with open(path, encoding="utf-8") as source:
-        while line := source.readline(CHUNK_SIZE + 1):
-            if len(line) > CHUNK_SIZE:
-                raise ResourceLimitError("Text line exceeds 64 KiB; download the file instead.")
-            total += 1
-            if total < (start_line or 1) or end_line is not None and total > end_line:
-                continue
-            line_size = len(line.encode())
-            if line_size > MAX_RESPONSE_BYTES:
-                raise ResourceLimitError("Requested line exceeds the response byte limit.")
-            if truncated or size + line_size > MAX_RESPONSE_BYTES or len(selected) >= MAX_TEXT_LINES:
-                if next_line is None:
-                    next_line = total
-                truncated = True
-                continue
-            selected.append(line)
-            size += line_size
-    return {"total_lines": total, "content": "".join(selected), "truncated": truncated, "next_line": next_line}
+        for total, chunk in text_chunks(source):
+            if total >= (start_line or 1) and (end_line is None or total <= end_line):
+                selected.write(chunk)
+    return {"total_lines": total, "content": selected.getvalue()}
+
+
+def text_file_response(path, display_path, start_line=None, end_line=None):
+    """Build the original JSON response on disk, including arbitrarily long lines."""
+    fd, temporary = tempfile.mkstemp(suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output, open(path, encoding="utf-8") as source:
+            output.write('{"path":' + json.dumps(display_path) + ',"content":"')
+            total = 0
+            for total, chunk in text_chunks(source):
+                if total >= (start_line or 1) and (end_line is None or total <= end_line):
+                    output.write(json.dumps(chunk, ensure_ascii=False)[1:-1])
+            output.write('","total_lines":' + str(total) + '}')
+        return TemporaryFileResponse(temporary, media_type="application/json")
+    except BaseException:
+        os.unlink(temporary)
+        raise
 
 
 class UserFS:
@@ -190,19 +212,13 @@ class UserFS:
         """Read raw bytes from *path*."""
         self._check_path(path)
         async with aiofiles.open(path, "rb") as f:
-            data = await f.read(MAX_RESPONSE_BYTES + 1)
-            if len(data) > MAX_RESPONSE_BYTES:
-                raise ResourceLimitError("File exceeds the in-memory read limit; use a streamed download.")
-            return data
+            return await f.read()
 
     async def read_text(self, path: str, encoding: str = "utf-8") -> str:
         """Read text from *path*."""
         self._check_path(path)
         async with aiofiles.open(path, "r", encoding=encoding, errors="strict") as f:
-            text = await f.read(MAX_RESPONSE_BYTES + 1)
-            if len(text.encode(encoding)) > MAX_RESPONSE_BYTES or text.count("\n") > MAX_TEXT_LINES:
-                raise ResourceLimitError("Text exceeds the editing/read limit; use a smaller file or line range.")
-            return text
+            return await f.read()
 
     async def read_lines(self, path, start_line=None, end_line=None):
         self._check_path(path)
@@ -259,8 +275,6 @@ class UserFS:
             with os.scandir(path) as scan:
                 names = []
                 for entry in scan:
-                    if len(names) >= MAX_SEARCH_ENTRIES:
-                        raise ResourceLimitError("Directory contains too many entries; narrow the path.")
                     names.append(entry.name)
             for name in sorted(names):
                 full = os.path.join(path, name)
