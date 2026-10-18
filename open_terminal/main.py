@@ -2,9 +2,12 @@ import asyncio
 import hmac
 from importlib.metadata import version as _pkg_version
 import fnmatch
+import heapq
 import json
 import logging
 import tempfile
+from contextlib import asynccontextmanager
+import threading
 
 import aiofiles
 import aiofiles.os
@@ -22,16 +25,20 @@ from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import quote as url_quote
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.formparsers import MultiPartParser, MultiPartException
 from pydantic import BaseModel, Field
 
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
-from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner
-from open_terminal.utils.fs import UserFS
+from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner, read_pty, write_pty, PtyRunner
+from open_terminal.utils.fs import UserFS, TemporaryFileResponse, read_text_range
+from open_terminal.utils.limits import (CHUNK_SIZE, MAX_RESPONSE_BYTES, MAX_TRANSFER_BYTES, MAX_PROCESSES, MAX_SEARCH_ENTRIES, MAX_SEARCH_BYTES, ResourceLimitError, ResourceLimitsMiddleware, run_io, run_worker, worker_command)
 from open_terminal.utils.file_compare import CompareRequest, run_comparison
+from open_terminal.utils.search import search_entries, walk_entries, text_lines, snippet
 from open_terminal.utils.skills import join_skill_path, list_skill_resources, parse_skill_frontmatter
 
 MATCH_PAGE_SIZE = 100
@@ -175,42 +182,59 @@ def get_file_browser_root(fs: UserFS) -> dict[str, str] | None:
     return {"path": root_path, "label": label}
 
 
-def _preview_pdf(target: str) -> bytes | None:
+async def _preview_pdf(target: str) -> str | None:
     libreoffice = shutil.which("soffice") or shutil.which("libreoffice")
     if not libreoffice:
         return None
-
     with tempfile.TemporaryDirectory() as tmpdir:
-        command = [
-            libreoffice,
-            "--headless",
-            "--nologo",
-            "--nofirststartwizard",
-            "--nodefault",
-            "--nolockcheck",
-            "--convert-to",
-            "pdf",
-            "--outdir",
-            tmpdir,
-            target,
-        ]
-        subprocess.run(command, check=True, capture_output=True, timeout=60)
-        pdf_path = os.path.join(tmpdir, f"{os.path.splitext(os.path.basename(target))[0]}.pdf")
-        if not os.path.isfile(pdf_path):
-            matches = [name for name in os.listdir(tmpdir) if name.lower().endswith(".pdf")]
-            if not matches:
-                return None
-            pdf_path = os.path.join(tmpdir, sorted(matches)[0])
+        await run_worker([
+            libreoffice, "--headless", "--nologo", "--nofirststartwizard",
+            "--nodefault", "--nolockcheck", "--convert-to", "pdf", "--outdir", tmpdir, target,
+        ])
+        pdf = os.path.join(tmpdir, os.path.splitext(os.path.basename(target))[0] + ".pdf")
+        if not os.path.isfile(pdf):
+            return None
+        fd, result = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        try:
+            await run_io(shutil.copyfile, pdf, result)
+            return result
+        except BaseException:
+            os.unlink(result)
+            raise
 
-        with open(pdf_path, "rb") as f:
-            return f.read()
+
+@asynccontextmanager
+async def lifespan(app):
+    maintenance = asyncio.create_task(_maintenance_loop())
+    try:
+        yield
+    finally:
+        maintenance.cancel()
+        await asyncio.gather(maintenance, return_exceptions=True)
+        for process in list(_processes.values()):
+            if process.finished_at is None:
+                process.runner.kill(force=True)
+        await asyncio.gather(*(p.log_task for p in _processes.values() if p.log_task), return_exceptions=True)
+        if ENABLE_TERMINAL:
+            for sid in list(_terminal_sessions):
+                await _cleanup_session(sid)
+        if ENABLE_NOTEBOOKS:
+            from open_terminal.utils.notebooks import shutdown_notebooks
+            await shutdown_notebooks()
+        global _port_proxy_client
+        if _port_proxy_client is not None:
+            await _port_proxy_client.aclose()
+            _port_proxy_client = None
 
 
 app = FastAPI(
+    lifespan=lifespan,
     title="Open Terminal",
     description="A remote terminal API.",
     version=_pkg_version("open-terminal"),
 )
+app.add_middleware(ResourceLimitsMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in CORS_ALLOWED_ORIGINS.split(",")],
@@ -225,16 +249,11 @@ async def permission_error_handler(request: Request, exc: PermissionError):
     return JSONResponse(status_code=403, content={"detail": str(exc)})
 
 
-@app.middleware("http")
-async def normalize_null_query_params(request: Request, call_next):
-    """Strip query parameters whose value is the literal string 'null'."""
-    from urllib.parse import urlencode
+@app.exception_handler(ResourceLimitError)
+async def resource_limit_handler(request: Request, exc: ResourceLimitError):
+    return JSONResponse(status_code=413, content={"detail": str(exc)})
 
-    raw_params = request.query_params.multi_items()
-    cleaned = [(k, v) for k, v in raw_params if v.lower() != "null"]
-    if len(cleaned) != len(raw_params):
-        request.scope["query_string"] = urlencode(cleaned).encode("utf-8")
-    return await call_next(request)
+
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +263,7 @@ async def normalize_null_query_params(request: Request, call_next):
 
 class ExecRequest(BaseModel):
     command: str = Field(
-        ...,
+        ..., max_length=16384,
         description="Shell command to execute. Supports chaining (&&, ||, ;), pipes (|), and redirections.",
         json_schema_extra={"examples": ["echo hello", "ls -la && whoami"]},
     )
@@ -278,7 +297,7 @@ class WriteRequest(BaseModel):
 
 class ReplacementChunk(BaseModel):
     target: str = Field(
-        ...,
+        ..., min_length=1,
         description="Exact string to find. Must match precisely, including whitespace.",
     )
     replacement: str = Field(
@@ -325,7 +344,7 @@ class ReplaceRequest(BaseModel):
         description="Path to the file to modify.",
     )
     replacements: list[ReplacementChunk] = Field(
-        ...,
+        ..., max_length=100,
         description="List of find-and-replace operations to apply sequentially.",
     )
 
@@ -356,7 +375,9 @@ class BackgroundProcess:
     runner: ProcessRunner
     status: str = "running"
     exit_code: Optional[int] = None
+    error: Optional[str] = None
     log_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    input_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     finished_at: Optional[float] = field(default=None, repr=False)
     log_path: Optional[str] = field(default=None, repr=False)
     user_id: str = ""
@@ -364,6 +385,7 @@ class BackgroundProcess:
 
 
 _processes: dict[str, BackgroundProcess] = {}
+_starting_processes = 0
 _EXPIRY_SECONDS = 300  # auto-clean finished processes after 5 min
 
 
@@ -398,6 +420,9 @@ def _get_session_cwd(session_id: str | None, fs: "UserFS") -> str:
 def _set_session_cwd(session_id: str | None, path: str):
     """Store a session's cwd.  No-op if *session_id* is ``None``."""
     if session_id:
+        _expire_session_cwds()
+        if session_id not in _session_cwds and len(_session_cwds) >= 1024:
+            del _session_cwds[min(_session_cwds, key=lambda key: _session_cwds[key][1])]
         _session_cwds[session_id] = (path, time.time())
 
 
@@ -407,29 +432,45 @@ from open_terminal.utils.log import log_process, read_log
 
 
 def _cleanup_expired():
-    """Remove finished processes that have expired.
-
-    Also deletes log files older than *LOG_RETENTION_SECONDS*.
-    """
     now = time.time()
-    expired = [
-        process_id
-        for process_id, background_process in _processes.items()
-        if background_process.finished_at
-        and now - background_process.finished_at > _EXPIRY_SECONDS
-    ]
-    for process_id in expired:
-        bp = _processes.pop(process_id)
-        # Delete the log file if it has exceeded the retention period.
-        if (
-            bp.log_path
-            and bp.finished_at
-            and now - bp.finished_at > PROCESS_LOG_RETENTION
-        ):
-            try:
-                os.remove(bp.log_path)
-            except OSError:
-                pass
+    finished = [p for p in _processes.values() if p.finished_at is not None]
+    finished.sort(key=lambda p: p.finished_at)
+    for index, process in enumerate(finished):
+        if now - process.finished_at > _EXPIRY_SECONDS or index < len(finished) - 256:
+            _processes.pop(process.id, None)
+
+
+def _cleanup_log_files(active_paths):
+    directory = os.path.join(LOG_DIR, "processes")
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.path in active_paths or not entry.name.endswith((".jsonl", ".rotating")):
+                    continue
+                try:
+                    if entry.is_file(follow_symlinks=False) and time.time() - entry.stat().st_mtime > PROCESS_LOG_RETENTION:
+                        os.unlink(entry.path)
+                except OSError:
+                    pass
+    except FileNotFoundError:
+        pass
+
+
+async def _maintenance_loop():
+    while True:
+        _cleanup_expired()
+        _expire_session_cwds()
+        if ENABLE_TERMINAL:
+            for sid, session in list(_terminal_sessions.items()):
+                idle = time.time() - session["last_active"]
+                if not _session_is_alive(session) or (not session["connected"] and idle > 60):
+                    await _cleanup_session(sid)
+        active = {p.log_path for p in _processes.values() if p.finished_at is None}
+        try:
+            await run_io(_cleanup_log_files, active)
+        except OSError as exc:
+            log.warning("Log retention cleanup failed: %s", exc)
+        await asyncio.sleep(60)
 
 
 def _get_process(process_id: str, request: Request) -> BackgroundProcess:
@@ -512,6 +553,7 @@ async def _list_skills_in_dir(fs: UserFS, root: str, scope: str) -> list[SkillSu
         return []
 
     skills: list[SkillSummary] = []
+    response_bytes = 0
     for entry in await fs.listdir(root):
         dirname = str(entry.get("name") or "")
         if entry.get("type") != "directory" or not dirname or dirname.startswith("."):
@@ -527,15 +569,17 @@ async def _list_skills_in_dir(fs: UserFS, root: str, scope: str) -> list[SkillSu
         name = (frontmatter.get("name") or dirname).strip()
         if not name:
             continue
-        skills.append(
-            SkillSummary(
-                id=f"terminal:{url_quote(name, safe='')}",
-                name=name,
-                description=description[:1024],
-                location=skill_path,
-                scope=scope,
-            )
+        skill = SkillSummary(
+            id=f"terminal:{url_quote(name, safe='')}",
+            name=name,
+            description=description[:1024],
+            location=skill_path,
+            scope=scope,
         )
+        response_bytes += len(skill.model_dump_json().encode())
+        if response_bytes > MAX_RESPONSE_BYTES:
+            raise ResourceLimitError("Skill listing exceeds the response size limit.")
+        skills.append(skill)
     return skills
 
 
@@ -596,6 +640,7 @@ async def list_skills(
     seen_names: set[str] = set()
     seen_roots: set[str] = set()
     skills: list[SkillSummary] = []
+    response_bytes = 0
 
     for scope, root in roots:
         root = os.path.normpath(root)
@@ -606,6 +651,9 @@ async def list_skills(
             if skill.name in seen_names:
                 continue
             seen_names.add(skill.name)
+            response_bytes += len(skill.model_dump_json().encode())
+            if response_bytes > MAX_RESPONSE_BYTES:
+                raise ResourceLimitError("Skill listing exceeds the response size limit.")
             skills.append(skill)
 
     return skills
@@ -699,50 +747,33 @@ async def read_file(
     if not await fs.isfile(target):
         raise HTTPException(status_code=404, detail="File not found")
 
+    fs._check_path(target)
+    import mimetypes
+    from open_terminal.utils.documents import EXTRACTORS
+
+    mime = mimetypes.guess_type(target)[0] or "application/octet-stream"
+    if any(mime.startswith(prefix) for prefix in BINARY_FILE_MIME_PREFIXES):
+        return FileResponse(target, media_type=mime)
+    if any(kind and mime == kind or suffix and target.lower().endswith(suffix) for kind, suffix, _ in EXTRACTORS):
+        result = json.loads(await run_worker(
+            [sys.executable, "-m", "open_terminal.utils.documents"],
+            json.dumps({"path": target}).encode(), request=http_request,
+        ))
+        if "error" in result:
+            raise ResourceLimitError(result["error"])
+        # Extraction is bounded in the worker; use the same range/byte semantics.
+        fd, extracted_path = tempfile.mkstemp(suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as extracted:
+                extracted.write(result["text"])
+            del result
+            return {"path": target, **await run_io(read_text_range, extracted_path, start_line, end_line)}
+        finally:
+            os.unlink(extracted_path)
     try:
-        content = await fs.read_text(target)
-        lines = content.splitlines(keepends=True)
-    except (UnicodeDecodeError, ValueError):
-        import mimetypes
-
-        raw = await fs.read(target)
-        mime, _ = mimetypes.guess_type(target)
-        mime = mime or "application/octet-stream"
-
-        # Try document text extraction (PDF, Office, OpenDocument, etc.)
-        from open_terminal.utils.documents import EXTRACTORS
-
-        for ext_mime, ext_suffix, extractor in EXTRACTORS:
-            if (ext_mime and mime == ext_mime) or (
-                ext_suffix and target.lower().endswith(ext_suffix)
-            ):
-                text = await asyncio.to_thread(extractor, target)
-                lines = text.splitlines(keepends=True)
-                start = (start_line or 1) - 1
-                end = end_line or len(lines)
-                return {
-                    "path": target,
-                    "total_lines": len(lines),
-                    "content": "".join(lines[start:end]),
-                }
-
-        # Return raw binary for allowed mime type prefixes (e.g. image/*)
-        if any(mime.startswith(prefix) for prefix in BINARY_FILE_MIME_PREFIXES):
-            return Response(content=raw, media_type=mime)
-
-        # Other binary files: reject (LLMs can't interpret raw bytes)
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported binary file type: {mime} ({len(raw)} bytes)",
-        )
-
-    start = (start_line or 1) - 1
-    end = end_line or len(lines)
-    return {
-        "path": target,
-        "total_lines": len(lines),
-        "content": "".join(lines[start:end]),
-    }
+        return {"path": target, **await fs.read_lines(target, start_line, end_line)}
+    except UnicodeDecodeError:
+        raise HTTPException(415, f"Unsupported binary file type: {mime}")
 
 
 @app.get(
@@ -797,20 +828,21 @@ async def view_file(
         ext = os.path.splitext(target)[1].lower()
         if ext in (".docx", ".pptx"):
             try:
-                pdf = await asyncio.to_thread(_preview_pdf, target)
+                fs._check_path(target)
+                pdf = await _preview_pdf(target)
             except Exception:
                 log.exception("Rendered preview failed for %s", target)
                 pdf = None
 
             if pdf:
-                return Response(content=pdf, media_type="application/pdf")
+                return TemporaryFileResponse(pdf, media_type="application/pdf")
 
     import mimetypes
 
     mime, _ = mimetypes.guess_type(target)
     mime = mime or "application/octet-stream"
-    raw = await fs.read(target)
-    return Response(content=raw, media_type=mime)
+    fs._check_path(target)
+    return FileResponse(target, media_type=mime)
 
 
 @app.get(
@@ -949,6 +981,9 @@ async def replace_file_content(http_request: Request, request: ReplaceRequest, f
                 detail=f"Found {count} occurrences of target string but allow_multiple is false",
             )
 
+        new_size = len(content.encode()) + count * (len(chunk.replacement.encode()) - len(chunk.target.encode()))
+        if new_size > MAX_RESPONSE_BYTES:
+            raise ResourceLimitError("Replacement would exceed the text editing size limit.")
         if chunk.start_line or chunk.end_line:
             new_region = search_region.replace(chunk.target, chunk.replacement)
             lines[start:end] = [new_region]
@@ -1020,56 +1055,49 @@ async def grep_search(
 
         matches = []
         truncated = False
+        scanned_bytes = 0
+        response_bytes = 0
 
         def _search_file(file_path: str):
-            nonlocal truncated
-            if truncated:
-                return
+            nonlocal truncated, scanned_bytes, response_bytes
             try:
-                with open(file_path, "r", encoding="utf-8", errors="strict") as f:
-                    for line_number, line in enumerate(f, 1):
-                        if pattern.search(line):
-                            if match_per_line:
-                                matches.append(
-                                    {
-                                        "file": file_path,
-                                        "line": line_number,
-                                        "content": line.rstrip("\n\r"),
-                                    }
-                                )
-                                if len(matches) >= max_results:
-                                    truncated = True
-                                    return
-                            else:
-                                matches.append({"file": file_path})
-                                if len(matches) >= max_results:
-                                    truncated = True
-                                return  # one match per file is enough
-            except (UnicodeDecodeError, ValueError, OSError):
-                pass  # skip binary or unreadable files
+                scanned_bytes += os.path.getsize(file_path)
+                if scanned_bytes > MAX_SEARCH_BYTES:
+                    truncated = True
+                    return
+                for line_number, line in text_lines(file_path):
+                    match = pattern.search(line)
+                    if match:
+                        entry = {"file": file_path}
+                        if match_per_line:
+                            entry.update(line=line_number, content=snippet(line, match.start()))
+                        entry_size = len(json.dumps(entry).encode())
+                        if response_bytes + entry_size > MAX_RESPONSE_BYTES:
+                            truncated = True
+                            return
+                        response_bytes += entry_size
+                        matches.append(entry)
+                        if len(matches) >= max_results:
+                            truncated = True
+                            return
+                        if not match_per_line:
+                            return
+            except (UnicodeError, OSError):
+                pass
 
+        fs._check_path(target)
         if os.path.isfile(target):
             _search_file(target)
         else:
-            for dirpath, dirnames, filenames in os.walk(target):
-                # Prune directories belonging to other users.
-                dirnames[:] = [
-                    d for d in dirnames
-                    if fs.is_path_allowed(os.path.join(dirpath, d))
-                ]
+            for full, entry_type in walk_entries(fs, target):
                 if truncated:
                     break
-                for filename in sorted(filenames):
-                    if not _matches_include(filename):
-                        continue
-                    full = os.path.join(dirpath, filename)
-                    if not fs.is_path_allowed(full):
-                        continue
+                if entry_type == "file" and not os.path.islink(full) and _matches_include(os.path.basename(full)):
                     _search_file(full)
 
         return matches, truncated
 
-    matches, truncated = await asyncio.to_thread(_search_sync)
+    matches, truncated = await run_io(_search_sync)
     return {
         "query": query,
         "path": target,
@@ -1095,7 +1123,7 @@ async def match_files(
     query: str = Query(..., description="Literal text to match."),
     path: str = Query(".", description="Directory to search within."),
     show_hidden: bool = Query(False, description="Include hidden dotfiles and dot-directories."),
-    offset: int = Query(0, description="Result offset.", ge=0),
+    offset: int = Query(0, description="Result offset (narrow the search beyond 1000 results).", ge=0, le=1000),
     limit: int = Query(
         MATCH_PAGE_SIZE,
         description="Maximum number of results to return.",
@@ -1116,194 +1144,45 @@ async def match_files(
 
     def _matches_sync():
         query_lower = query.lower()
+        scanned_bytes = 0
+        total = 0
 
-        def is_hidden_path(candidate: str) -> bool:
-            return any(part.startswith(".") for part in candidate.replace("\\", "/").split("/") if part)
-
-        def content_match(text: str, line: int) -> dict | None:
-            text = text.rstrip("\r\n")
-            index = text.lower().find(query_lower)
-            if index < 0:
-                return None
-            column = len(text[:index].encode("utf-16-le")) // 2 + 1
-            return {"line": line, "column": column, "text": text}
-
-        def walk_entries() -> list[tuple[str, str]]:
-            try:
-                git_result = subprocess.run(
-                    ["git", "-C", target, "ls-files", "-co", "--exclude-standard", "-z", "--", "."],
-                    check=False,
-                    capture_output=True,
-                )
-            except OSError:
-                git_result = None
-
-            if git_result and git_result.returncode == 0:
-                git_entries = []
-                seen = set()
-                for raw in git_result.stdout.split(b"\0"):
-                    if not raw:
-                        continue
-                    rel_path = os.fsdecode(raw)
-                    if not show_hidden and is_hidden_path(rel_path):
-                        continue
-                    full_path = os.path.normpath(os.path.join(target, rel_path))
-                    if not fs.is_path_allowed(full_path):
-                        continue
-                    parent_rel = os.path.dirname(rel_path)
-                    while parent_rel and parent_rel != ".":
-                        if show_hidden or not is_hidden_path(parent_rel):
-                            directory = os.path.normpath(os.path.join(target, parent_rel))
-                            if directory not in seen and fs.is_path_allowed(directory):
-                                seen.add(directory)
-                                git_entries.append((directory, "directory"))
-                        parent_rel = os.path.dirname(parent_rel)
-                    if full_path not in seen:
-                        seen.add(full_path)
-                        git_entries.append((full_path, "directory" if os.path.isdir(full_path) else "file"))
-                return sorted(git_entries, key=lambda item: os.path.relpath(item[0], target).lower())
-
-            entries = []
-            for dirpath, dirnames, filenames in os.walk(target):
-                dirnames[:] = [
-                    d
-                    for d in sorted(dirnames)
-                    if (show_hidden or not d.startswith("."))
-                    and fs.is_path_allowed(os.path.join(dirpath, d))
-                ]
-                for name in dirnames:
-                    entries.append((os.path.join(dirpath, name), "directory"))
-                for name in sorted(filenames):
-                    if show_hidden or not name.startswith("."):
-                        full_path = os.path.join(dirpath, name)
-                        if fs.is_path_allowed(full_path):
-                            entries.append((full_path, "file"))
-            return entries
-
-        def content_matches_with_rg(files: set[str]) -> dict[str, list[dict]] | None:
-            rg = shutil.which("rg")
-            if not rg:
-                return None
-            args = [
-                rg,
-                "--json",
-                "--no-messages",
-                "--fixed-strings",
-                "--ignore-case",
-                "--line-number",
-                "--column",
-                "--max-count",
-                str(MAX_CONTENT_MATCHES_PER_FILE + 1),
-            ]
-            if show_hidden:
-                args.append("--hidden")
-            args.extend(("--", query, target))
-            try:
-                completed = subprocess.run(args, capture_output=True, text=True, check=False)
-            except OSError:
-                return None
-            if completed.returncode not in (0, 1):
-                return None
-
-            matches: dict[str, list[dict]] = {}
-            for raw in completed.stdout.splitlines():
-                try:
-                    message = json.loads(raw)
-                except json.JSONDecodeError:
+        def candidates():
+            nonlocal scanned_bytes, total
+            for entry_path, entry_type in search_entries(fs, target, show_hidden):
+                rel_path = os.path.relpath(entry_path, target).replace("\\", "/")
+                name = os.path.basename(entry_path)
+                name_lower, rel_lower = name.lower(), rel_path.lower()
+                score = (0 if name_lower == query_lower else 1 if name_lower.startswith(query_lower)
+                    else 2 if query_lower in name_lower else 3 if query_lower in rel_lower else 4)
+                content_matches = []
+                if entry_type == "file" and not os.path.islink(entry_path):
+                    try:
+                        size = os.path.getsize(entry_path)
+                        if size <= MAX_CONTENT_SEARCH_FILE_SIZE:
+                            scanned_bytes += size
+                            if scanned_bytes > MAX_SEARCH_BYTES:
+                                raise ResourceLimitError("Content search exceeds the scan budget; narrow the path.")
+                            for number, text in text_lines(entry_path):
+                                index = text.lower().find(query_lower)
+                                if index >= 0:
+                                    content_matches.append({"line": number, "column": len(text[:index].encode("utf-16-le")) // 2 + 1, "text": snippet(text, index)})
+                                    if len(content_matches) >= MAX_CONTENT_MATCHES_PER_FILE:
+                                        break
+                    except (OSError, UnicodeError):
+                        pass
+                if score == 4 and not content_matches:
                     continue
-                if message.get("type") != "match":
-                    continue
-                data = message["data"]
-                path = os.path.normpath(data["path"]["text"])
-                if path not in files:
-                    continue
-                line_matches = matches.setdefault(path, [])
-                if len(line_matches) >= MAX_CONTENT_MATCHES_PER_FILE:
-                    continue
-                match = content_match(data["lines"]["text"], data["line_number"])
-                if match:
-                    line_matches.append(match)
-            return matches
+                total += 1
+                yield (score, len(rel_path), rel_lower, {
+                    "path": entry_path, "relative_path": rel_path, "name": name,
+                    "type": entry_type, "name_match": score < 4, "content_matches": content_matches,
+                })
 
-        def content_matches_with_python(files: set[str]) -> dict[str, list[dict]]:
-            matches: dict[str, list[dict]] = {}
-            for file_path in files:
-                try:
-                    if os.path.getsize(file_path) > MAX_CONTENT_SEARCH_FILE_SIZE:
-                        continue
-                    with open(file_path, "rb") as source:
-                        if b"\0" in source.read(8192):
-                            continue
-                    with open(file_path, "r", encoding="utf-8", errors="replace") as source:
-                        lines = source.read().splitlines()
-                except OSError:
-                    continue
+        matches = heapq.nsmallest(offset + limit, candidates(), key=lambda item: item[:3])
+        return {"results": [item[3] for item in matches[offset:]], "next_offset": offset + limit if total > offset + limit else None}
 
-                for number, text in enumerate(lines, start=1):
-                    match = content_match(text, number)
-                    if not match:
-                        continue
-                    file_matches = matches.setdefault(file_path, [])
-                    if len(file_matches) >= MAX_CONTENT_MATCHES_PER_FILE:
-                        break
-                    file_matches.append(match)
-            return matches
-
-        entries = walk_entries()
-        files = {
-            os.path.normpath(entry_path)
-            for entry_path, entry_type in entries
-            if entry_type == "file" and not os.path.islink(entry_path)
-        }
-        content_matches = content_matches_with_rg(files)
-        if content_matches is None:
-            content_matches = content_matches_with_python(files)
-
-        matches = []
-        for entry_path, entry_type in entries:
-            rel_path = os.path.relpath(entry_path, target).replace("\\", "/")
-            name = os.path.basename(entry_path)
-            name_lower = name.lower()
-            rel_lower = rel_path.lower()
-            if name_lower == query_lower:
-                score = 0
-            elif name_lower.startswith(query_lower):
-                score = 1
-            elif query_lower in name_lower:
-                score = 2
-            elif query_lower in rel_lower:
-                score = 3
-            else:
-                score = 4
-
-            entry_content_matches = content_matches.get(os.path.normpath(entry_path), []) if entry_type == "file" else []
-            name_match = score < 4
-            if not name_match and not entry_content_matches:
-                continue
-            matches.append(
-                (
-                    score,
-                    len(rel_path),
-                    rel_lower,
-                    {
-                        "path": entry_path,
-                        "relative_path": rel_path,
-                        "name": name,
-                        "type": entry_type,
-                        "name_match": name_match,
-                        "content_matches": entry_content_matches,
-                    },
-                )
-            )
-
-        matches.sort(key=lambda item: (item[0], item[1], item[2]))
-        next_offset = offset + limit if offset + limit < len(matches) else None
-        return {
-            "results": [item[3] for item in matches[offset : offset + limit]],
-            "next_offset": next_offset,
-        }
-
-    return await asyncio.to_thread(_matches_sync)
+    return await run_io(_matches_sync)
 
 
 @app.get(
@@ -1338,106 +1217,25 @@ async def search_files(
 
     def _search_sync():
         query_lower = query.strip().lower()
-        candidates = []
-        seen = set()
-
-        try:
-            git_result = subprocess.run(
-                ["git", "-C", target, "ls-files", "-co", "--exclude-standard", "-z", "--", "."],
-                check=False,
-                capture_output=True,
-            )
-        except OSError:
-            git_result = None
-
-        if git_result and git_result.returncode == 0:
-            for raw in git_result.stdout.split(b"\0"):
-                if not raw:
+        def candidates():
+            for full_path, entry_type in search_entries(fs, target, show_hidden):
+                if type != "any" and entry_type != type:
                     continue
-                rel_path = os.fsdecode(raw)
-                parts = rel_path.replace("\\", "/").split("/")
-                if not show_hidden and any(part.startswith(".") for part in parts):
+                name = os.path.basename(full_path)
+                lower = name.lower()
+                if query_lower and query_lower not in lower:
                     continue
+                rank = 0 if lower == query_lower else 1 if lower.startswith(query_lower) else 2
+                try:
+                    info = os.stat(full_path)
+                except OSError:
+                    continue
+                yield (rank, len(name), os.path.relpath(full_path, target).lower(), {
+                    "path": full_path, "name": name, "type": entry_type, "size": info.st_size, "modified": info.st_mtime,
+                })
+        return [item[3] for item in heapq.nsmallest(limit, candidates(), key=lambda item: item[:3])]
 
-                full_path = os.path.normpath(os.path.join(target, rel_path))
-                if type in ("any", "file") and full_path not in seen:
-                    seen.add(full_path)
-                    candidates.append((full_path, "file"))
-
-                if type in ("any", "directory"):
-                    parent_rel = os.path.dirname(rel_path)
-                    while parent_rel and parent_rel != ".":
-                        if show_hidden or not any(
-                            part.startswith(".") for part in parent_rel.replace("\\", "/").split("/")
-                        ):
-                            directory = os.path.normpath(os.path.join(target, parent_rel))
-                            if directory not in seen:
-                                seen.add(directory)
-                                candidates.append((directory, "directory"))
-                        parent_rel = os.path.dirname(parent_rel)
-        else:
-            for dirpath, dirnames, filenames in os.walk(target):
-                dirnames[:] = [
-                    d
-                    for d in dirnames
-                    if (show_hidden or not d.startswith("."))
-                    and fs.is_path_allowed(os.path.join(dirpath, d))
-                ]
-
-                if type in ("any", "directory"):
-                    for name in dirnames:
-                        full_path = os.path.join(dirpath, name)
-                        if full_path not in seen:
-                            seen.add(full_path)
-                            candidates.append((full_path, "directory"))
-
-                if type in ("any", "file"):
-                    for name in filenames:
-                        if not show_hidden and name.startswith("."):
-                            continue
-                        full_path = os.path.join(dirpath, name)
-                        if full_path not in seen:
-                            seen.add(full_path)
-                            candidates.append((full_path, "file"))
-
-        matches = []
-        for full_path, entry_type in candidates:
-            if not fs.is_path_allowed(full_path):
-                continue
-
-            name = os.path.basename(full_path)
-            name_lower = name.lower()
-            if query_lower and query_lower in name_lower:
-                rank = 0 if name_lower == query_lower else 1 if name_lower.startswith(query_lower) else 2
-            elif not query_lower:
-                rank = 2
-            else:
-                continue
-
-            try:
-                file_stat = os.stat(full_path)
-            except OSError:
-                continue
-
-            matches.append(
-                (
-                    rank,
-                    len(name),
-                    os.path.relpath(full_path, target).lower(),
-                    {
-                        "path": full_path,
-                        "name": name,
-                        "type": entry_type,
-                        "size": file_stat.st_size,
-                        "modified": file_stat.st_mtime,
-                    },
-                )
-            )
-
-        matches.sort(key=lambda item: (item[0], item[1], item[2]))
-        return [item[3] for item in matches[:limit]]
-
-    return {"results": await asyncio.to_thread(_search_sync)}
+    return {"results": await run_io(_search_sync)}
 
 
 @app.get(
@@ -1478,62 +1276,27 @@ async def glob_search(
         matches = []
         truncated = False
 
-        for dirpath, dirnames, filenames in os.walk(target):
-            if truncated:
+        for full_path, entry_type in walk_entries(fs, target):
+            if type != "any" and type != entry_type:
+                continue
+            name = os.path.basename(full_path)
+            rel_path = os.path.relpath(full_path, target)
+            if not fnmatch.fnmatch(name, pattern) and not fnmatch.fnmatch(rel_path, pattern):
+                continue
+            if exclude and any(fnmatch.fnmatch(name, item) or fnmatch.fnmatch(rel_path, item) for item in exclude):
+                continue
+            try:
+                info = os.stat(full_path)
+                matches.append({"path": rel_path, "type": entry_type, "size": info.st_size, "modified": info.st_mtime})
+            except OSError:
+                continue
+            if len(matches) >= max_results:
+                truncated = True
                 break
-
-            # Prune directories belonging to other users.
-            dirnames[:] = [
-                d for d in dirnames
-                if fs.is_path_allowed(os.path.join(dirpath, d))
-            ]
-
-            entries = []
-            if type in ("any", "directory"):
-                entries.extend([(d, "directory") for d in dirnames])
-            if type in ("any", "file"):
-                entries.extend([(f, "file") for f in filenames])
-
-            for name, entry_type in sorted(entries, key=lambda x: x[0]):
-                if truncated:
-                    break
-
-                full_path = os.path.join(dirpath, name)
-                rel_path = os.path.relpath(full_path, target)
-
-                # Check inclusion pattern
-                if not fnmatch.fnmatch(name, pattern) and not fnmatch.fnmatch(
-                    rel_path, pattern
-                ):
-                    continue
-
-                # Check exclusion patterns
-                if exclude and any(
-                    fnmatch.fnmatch(name, excl) or fnmatch.fnmatch(rel_path, excl)
-                    for excl in exclude
-                ):
-                    continue
-
-                try:
-                    file_stat = os.stat(full_path)
-                    matches.append(
-                        {
-                            "path": rel_path,
-                            "type": entry_type,
-                            "size": file_stat.st_size,
-                            "modified": file_stat.st_mtime,
-                        }
-                    )
-
-                    if len(matches) >= max_results:
-                        truncated = True
-                        break
-                except OSError:
-                    pass
 
         return matches, truncated
 
-    matches, truncated = await asyncio.to_thread(_glob_sync)
+    matches, truncated = await run_io(_glob_sync)
     return {
         "pattern": pattern,
         "path": target,
@@ -1542,6 +1305,35 @@ async def glob_search(
     }
 
 
+
+
+class UploadParser(MultiPartParser):
+    async def parse(self):
+        try:
+            return await super().parse()
+        except BaseException:
+            # Starlette closes these on MultiPartException only. Disconnects,
+            # cancellation, and body-limit errors must release spools as well.
+            for file in self._files_to_close_on_error:
+                file.close()
+            raise
+
+    def on_part_begin(self):
+        self._header_bytes = 0
+        super().on_part_begin()
+
+    def _check_header(self, start, end):
+        self._header_bytes += end - start
+        if self._header_bytes > 16 * 1024:
+            raise MultiPartException("Upload headers exceed the size limit.")
+
+    def on_header_field(self, data, start, end):
+        self._check_header(start, end)
+        super().on_header_field(data, start, end)
+
+    def on_header_value(self, data, start, end):
+        self._check_header(start, end)
+        super().on_header_value(data, start, end)
 
 
 @app.post(
@@ -1556,31 +1348,49 @@ async def glob_search(
     },
 )
 async def upload_file(
+    http_request: Request,
     directory: str = Query(..., description="Destination directory for the file."),
-    file: UploadFile = File(
-        ..., description="The file to upload."
-    ),
     fs: UserFS = Depends(get_filesystem),
 ):
-    content = await file.read()
+    try:
+        form = await UploadParser(http_request.headers, http_request.stream(), max_files=1, max_fields=0).parse()
+    except MultiPartException as exc:
+        raise HTTPException(400, exc.message) from None
+    file = form.get("file")
+    if not isinstance(file, StarletteUploadFile):
+        await form.close()
+        raise HTTPException(422, "One multipart file named 'file' is required.")
     filename = os.path.basename(file.filename or "upload")
-
     directory = fs.resolve_path(directory)
     path = os.path.normpath(os.path.join(directory, filename))
-
+    temporary = None
+    size = 0
     try:
+        fs._check_path(path)
         await fs.mkdir(directory)
-        await fs.write_bytes(path, content)
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except OSError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"path": path, "size": len(content)}
+        fd, temporary = tempfile.mkstemp(dir=directory, prefix=".upload-")
+        os.close(fd)
+        async with aiofiles.open(temporary, "wb") as output:
+            while chunk := await file.read(CHUNK_SIZE):
+                size += len(chunk)
+                if size > MAX_TRANSFER_BYTES:
+                    raise ResourceLimitError("Upload exceeds the transfer size limit.")
+                await output.write(chunk)
+        await fs._chown(temporary)
+        await aiofiles.os.replace(temporary, path)
+    finally:
+        await form.close()
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    return {"path": path, "size": size}
 
 
 class ArchiveRequest(BaseModel):
     paths: list[str] = Field(
-        ...,
+        ..., max_length=100,
         description="List of file or directory paths to include in the ZIP archive.",
     )
 
@@ -1595,7 +1405,6 @@ async def archive_paths(
     fs: UserFS = Depends(get_filesystem),
 ):
     """Bundle files and/or directories into a single ZIP archive."""
-    import io
     import zipfile
 
     if not request.paths:
@@ -1614,37 +1423,44 @@ async def archive_paths(
     else:
         archive_name = "download"
 
-    def _build_zip() -> bytes:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for target in resolved:
-                if os.path.isfile(target):
-                    zf.write(target, os.path.basename(target))
-                elif os.path.isdir(target):
-                    dirname = os.path.basename(target.rstrip("/\\")) or "dir"
-                    for dirpath, dirnames, filenames in os.walk(target):
-                        dirnames[:] = [
-                            d for d in dirnames
-                            if fs.is_path_allowed(os.path.join(dirpath, d))
-                        ]
-                        for fname in filenames:
-                            full = os.path.join(dirpath, fname)
-                            if not fs.is_path_allowed(full):
-                                continue
-                            arcname = os.path.join(
-                                dirname, os.path.relpath(full, target)
-                            )
-                            zf.write(full, arcname)
-        return buf.getvalue()
+    fd, temporary = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    stop = threading.Event()
 
-    data = await asyncio.to_thread(_build_zip)
-    return Response(
-        content=data,
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{archive_name}.zip"',
-        },
-    )
+    def _build_zip():
+        count = 0
+        total = 0
+        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+            for target in resolved:
+                fs._check_path(target)
+                entries = [(target, "file")] if os.path.isfile(target) else walk_entries(fs, target)
+                for full, entry_type in entries:
+                    if entry_type != "file" or os.path.islink(full):
+                        continue
+                    if stop.is_set():
+                        return
+                    count += 1
+                    if count > MAX_SEARCH_ENTRIES:
+                        raise ResourceLimitError("Archive contains too many files.")
+                    arcname = os.path.basename(full) if full == target else os.path.join(os.path.basename(target.rstrip("/\\")) or "dir", os.path.relpath(full, target))
+                    with open(full, "rb") as source, archive.open(arcname, "w") as destination:
+                        while chunk := source.read(CHUNK_SIZE):
+                            if stop.is_set():
+                                return
+                            total += len(chunk)
+                            if total > MAX_TRANSFER_BYTES:
+                                raise ResourceLimitError("Archive exceeds the transfer size limit.")
+                            destination.write(chunk)
+
+    task = asyncio.create_task(asyncio.to_thread(_build_zip))
+    try:
+        await asyncio.shield(task)
+        return TemporaryFileResponse(temporary, media_type="application/zip", filename=f"{archive_name}.zip")
+    except BaseException:
+        stop.set()
+        await asyncio.gather(task, return_exceptions=True)
+        os.unlink(temporary)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1667,9 +1483,10 @@ async def list_processes(http_request: Request):
     return [
         {
             "id": background_process.id,
-            "command": background_process.command,
+            "command": background_process.command[:1024],
             "status": background_process.status,
             "exit_code": background_process.exit_code,
+            "error": background_process.error,
             "log_path": background_process.log_path,
         }
         for background_process in _processes.values()
@@ -1703,15 +1520,21 @@ async def execute(
         ge=1,
     ),
 ):
+    global _starting_processes
+    _cleanup_expired()
+    if sum(p.finished_at is None for p in _processes.values()) + _starting_processes >= MAX_PROCESSES:
+        raise HTTPException(429, "Maximum active commands reached; stop a command or retry later.")
     fs = get_filesystem(http_request)
     session_id = http_request.headers.get("x-session-id")
     session_cwd = _get_session_cwd(session_id, fs) if session_id else None
     cwd = fs.resolve_path(request.cwd, cwd=session_cwd) if request.cwd else (session_cwd or fs.home)
 
     subprocess_env = {**os.environ, **request.env} if request.env else None
-    runner = await create_runner(
-        request.command, cwd, subprocess_env, run_as_user=fs.username
-    )
+    _starting_processes += 1
+    try:
+        runner = await create_runner(request.command, cwd, subprocess_env, run_as_user=fs.username)
+    finally:
+        _starting_processes -= 1
 
     process_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     log_path = os.path.join(LOG_DIR, "processes", f"{process_id}.jsonl")
@@ -1743,6 +1566,7 @@ async def execute(
         "cwd": cwd,
         "status": background_process.status,
         "exit_code": background_process.exit_code,
+        "error": background_process.error,
         "output": output,
         "truncated": truncated,
         "next_offset": next_offset,
@@ -1802,6 +1626,7 @@ async def get_status(
         "command": background_process.command,
         "status": background_process.status,
         "exit_code": background_process.exit_code,
+        "error": background_process.error,
         "output": output,
         "truncated": truncated,
         "next_offset": next_offset,
@@ -1831,9 +1656,15 @@ async def send_input(process_id: str, body: InputRequest, http_request: Request)
     text = body.input.encode("raw_unicode_escape").decode("unicode_escape")
 
     try:
-        background_process.runner.write_input(text.encode())
-        if isinstance(background_process.runner, PipeRunner):
-            await background_process.runner.drain_input()
+        async with asyncio.timeout(5), background_process.input_lock:
+            if isinstance(background_process.runner, PtyRunner):
+                await write_pty(background_process.runner._master_fd, text.encode())
+            else:
+                background_process.runner.write_input(text.encode())
+            if isinstance(background_process.runner, PipeRunner):
+                await background_process.runner.drain_input()
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=408, detail="Process is not accepting input")
     except (BrokenPipeError, ConnectionResetError, OSError):
         raise HTTPException(status_code=400, detail="Process stdin is closed")
 
@@ -1857,15 +1688,15 @@ async def kill_process(
     force: bool = Query(False, description="Send SIGKILL instead of SIGTERM."),
 ):
     background_process = _get_process(process_id, http_request)
-    if background_process.status == "running":
+    if background_process.finished_at is None:
         background_process.status = "killed"
         background_process.runner.kill(force=force)
-        exit_code = await background_process.runner.wait()
-        background_process.runner.close()
-        background_process.status = "killed"
-        background_process.exit_code = exit_code
-    background_process.finished_at = time.time()
-    return {"status": "killed"}
+        try:
+            await asyncio.wait_for(asyncio.shield(background_process.log_task), 3)
+        except asyncio.TimeoutError:
+            background_process.runner.kill(force=True)
+            await asyncio.shield(background_process.log_task)
+    return {"status": background_process.status}
 
 
 # ---------------------------------------------------------------------------
@@ -1876,7 +1707,7 @@ from open_terminal.utils.port import detect_listening_ports, get_descendant_pids
 
 
 async def _visible_ports(request: Request) -> list[dict]:
-    all_ports = await asyncio.to_thread(detect_listening_ports)
+    all_ports = await run_io(detect_listening_ports)
 
     try:
         fs = get_filesystem(request)
@@ -1895,7 +1726,7 @@ async def _visible_ports(request: Request) -> list[dict]:
             return []
 
     own_pid = os.getpid()
-    descendant_pids = await asyncio.to_thread(get_descendant_pids, own_pid)
+    descendant_pids = await run_io(get_descendant_pids, own_pid)
     return [p for p in all_ports if p.get("pid") in descendant_pids]
 
 
@@ -1957,18 +1788,14 @@ async def port_proxy(port: int, path: str, request: Request):
     for h in ("host", "transfer-encoding", "connection", "authorization"):
         headers.pop(h, None)
 
-    body = await request.body()
-
     import httpx
 
     client = await _get_port_proxy_client()
     try:
-        upstream = await client.request(
-            method=request.method,
-            url=target_url,
-            headers=headers,
-            content=body or None,
+        upstream_request = client.build_request(
+            method=request.method, url=target_url, headers=headers, content=request.stream(),
         )
+        upstream = await client.send(upstream_request, stream=True)
     except httpx.ConnectError:
         raise HTTPException(
             status_code=502,
@@ -1981,14 +1808,17 @@ async def port_proxy(port: int, path: str, request: Request):
         )
 
     response_headers = dict(upstream.headers)
-    for h in ("transfer-encoding", "connection", "content-encoding", "content-length"):
+    for h in ("transfer-encoding", "connection"):
         response_headers.pop(h, None)
 
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=response_headers,
-    )
+    class ProxyResponse(StreamingResponse):
+        async def __call__(self, scope, receive, send):
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                await upstream.aclose()
+
+    return ProxyResponse(upstream.aiter_raw(), status_code=upstream.status_code, headers=response_headers)
 
 
 # ---------------------------------------------------------------------------
@@ -2000,11 +1830,6 @@ if ENABLE_TERMINAL:
     import uuid as _uuid
     from datetime import datetime as _datetime
     from fastapi.responses import JSONResponse
-
-    try:
-        import select as _select
-    except ImportError:
-        _select = None  # Not available on all platforms in all contexts
 
     # Determine terminal backend: prefer Unix PTY, then pywinpty, else None
     if _PTY_AVAILABLE:
@@ -2021,7 +1846,7 @@ if ENABLE_TERMINAL:
     _terminal_sessions: dict[str, dict] = {}
 
 
-    def _cleanup_session(session_id: str):
+    async def _cleanup_session(session_id: str):
         """Clean up a terminal session's resources.
 
         For PTY sessions the shell is spawned with ``start_new_session=True``,
@@ -2033,6 +1858,11 @@ if ENABLE_TERMINAL:
         if session is None:
             return
 
+        tasks = session.get("io_tasks", ())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
         backend = session.get("backend")
 
         if backend == "pty":
@@ -2042,21 +1872,21 @@ if ENABLE_TERMINAL:
                 pass
 
             process = session["process"]
-            if process.poll() is None:
-                # Signal the whole process group first (graceful).
+            # The leader may have exited while background children remain.
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                await asyncio.to_thread(process.wait, timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
                 try:
-                    os.killpg(process.pid, signal.SIGTERM)
+                    os.killpg(process.pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    # Forceful kill of the entire group.
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                    process.wait()
+                await asyncio.to_thread(process.wait)
 
         elif backend == "winpty":
             pty_proc = session["pty_process"]
@@ -2079,7 +1909,7 @@ if ENABLE_TERMINAL:
         else:
             dead = [sid for sid, s in _terminal_sessions.items() if not s["pty_process"].isalive()]
         for sid in dead:
-            _cleanup_session(sid)
+            await _cleanup_session(sid)
 
         if len(_terminal_sessions) >= MAX_TERMINAL_SESSIONS:
             return JSONResponse(
@@ -2121,7 +1951,7 @@ if ENABLE_TERMINAL:
                 spawn_env = os.environ.copy()
                 spawn_env.setdefault("TERM", TERMINAL_TERM)
                 process = subprocess.Popen(
-                    shell_cmd,
+                    worker_command(shell_cmd),
                     stdin=slave_fd,
                     stdout=slave_fd,
                     stderr=slave_fd,
@@ -2171,6 +2001,7 @@ if ENABLE_TERMINAL:
             output=bytearray(),
             connected=False,
             input_lock=asyncio.Lock(),
+            last_active=time.time(),
         )
         return {
             "id": session_id,
@@ -2202,14 +2033,10 @@ if ENABLE_TERMINAL:
 
 
     async def _write_terminal(session: dict, data: bytes):
+        session["last_active"] = time.time()
         async with session["input_lock"]:
             if session["backend"] == "pty":
-                while data:
-                    try:
-                        written = os.write(session["master_fd"], data)
-                        data = data[written:]
-                    except BlockingIOError:
-                        await asyncio.sleep(0.01)
+                await write_pty(session["master_fd"], data)
             else:
                 await asyncio.to_thread(session["pty_process"].write, data.decode(errors="replace"))
 
@@ -2252,7 +2079,7 @@ if ENABLE_TERMINAL:
                 "pid": session["pid"],
             })
         for sid in to_remove:
-            _cleanup_session(sid)
+            await _cleanup_session(sid)
         return result
 
 
@@ -2263,7 +2090,7 @@ if ENABLE_TERMINAL:
         if session is None or not _owns_terminal(session, request):
             return JSONResponse({"error": "Session not found"}, status_code=404)
         if not _session_is_alive(session):
-            _cleanup_session(session_id)
+            await _cleanup_session(session_id)
             return JSONResponse({"error": "Session not found"}, status_code=404)
         return {
             "id": session_id,
@@ -2277,7 +2104,7 @@ if ENABLE_TERMINAL:
         """Kill and remove a terminal session."""
         if session_id not in _terminal_sessions or not _owns_terminal(_terminal_sessions[session_id], request):
             return JSONResponse({"error": "Session not found"}, status_code=404)
-        _cleanup_session(session_id)
+        await _cleanup_session(session_id)
         return {"status": "deleted"}
 
 
@@ -2304,7 +2131,7 @@ if ENABLE_TERMINAL:
             return
 
         if not _session_is_alive(session):
-            _cleanup_session(session_id)
+            await _cleanup_session(session_id)
             await ws.close(code=4004, reason="Session has ended")
             return
 
@@ -2341,20 +2168,6 @@ if ENABLE_TERMINAL:
             master_fd = session["master_fd"]
             process = session["process"]
 
-            def _blocking_read():
-                """Read from PTY using select() so we don't block forever."""
-                while not stop_event.is_set():
-                    try:
-                        rlist, _, _ = _select.select([master_fd], [], [], 0.1)
-                        if rlist:
-                            return os.read(master_fd, 4096)
-                    except (OSError, ValueError):
-                        return b""
-                return b""
-
-            def _check_alive():
-                return process.poll() is None
-
             def _do_resize(rows: int, cols: int):
                 fcntl.ioctl(
                     master_fd,
@@ -2375,9 +2188,6 @@ if ENABLE_TERMINAL:
                 except Exception:
                     return b""
 
-            def _check_alive():
-                return pty_proc.isalive()
-
             def _do_resize(rows: int, cols: int):
                 pty_proc.setwinsize(rows, cols)
 
@@ -2385,27 +2195,16 @@ if ENABLE_TERMINAL:
 
         async def _pty_reader():
             """Forward PTY output -> WebSocket."""
-            try:
-                while not stop_event.is_set():
-                    data = await loop.run_in_executor(None, _blocking_read)
-                    if not data:
-                        if stop_event.is_set():
-                            break
-                        if not _check_alive():
-                            break
-                        continue
-                    try:
-                        session["output"].extend(data)
-                        del session["output"][:-65536]
-                        await ws.send_bytes(data)
-                    except Exception:
-                        break
-            finally:
-                pass
+            while not stop_event.is_set():
+                data = await read_pty(master_fd) if backend == "pty" else await loop.run_in_executor(None, _blocking_read)
+                if not data:
+                    break
+                session["last_active"] = time.time()
+                session["output"].extend(data)
+                del session["output"][:-65536]
+                await ws.send_bytes(data)
 
-        reader_task = asyncio.create_task(_pty_reader())
-
-        try:
+        async def _ws_reader():
             while True:
                 msg = await ws.receive()
                 if msg["type"] == "websocket.disconnect":
@@ -2421,17 +2220,20 @@ if ENABLE_TERMINAL:
                             _do_resize(rows, cols)
                     except (json.JSONDecodeError, KeyError):
                         pass
-        except WebSocketDisconnect:
-            pass
+        tasks = (asyncio.create_task(_pty_reader()), asyncio.create_task(_ws_reader()))
+        session["io_tasks"] = tasks
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
             stop_event.set()
-            reader_task.cancel()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await _cleanup_session(session_id)
             try:
-                await reader_task
-            except (asyncio.CancelledError, Exception):
+                await ws.close()
+            except (WebSocketDisconnect, RuntimeError):
                 pass
-            # Clean up session on disconnect
-            _cleanup_session(session_id)
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,48 @@ import subprocess
 
 import aiofiles
 import aiofiles.os
+from starlette.responses import FileResponse
+
+from open_terminal.utils.limits import CHUNK_SIZE, MAX_RESPONSE_BYTES, MAX_SEARCH_ENTRIES, MAX_TEXT_LINES, ResourceLimitError, run_io
+
+
+class TemporaryFileResponse(FileResponse):
+    """Remove generated files even when sending the response is cancelled."""
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
+
+
+def read_text_range(path, start_line=None, end_line=None):
+    selected = []
+    size = 0
+    total = 0
+    truncated = False
+    next_line = None
+    with open(path, encoding="utf-8") as source:
+        while line := source.readline(CHUNK_SIZE + 1):
+            if len(line) > CHUNK_SIZE:
+                raise ResourceLimitError("Text line exceeds 64 KiB; download the file instead.")
+            total += 1
+            if total < (start_line or 1) or end_line is not None and total > end_line:
+                continue
+            line_size = len(line.encode())
+            if line_size > MAX_RESPONSE_BYTES:
+                raise ResourceLimitError("Requested line exceeds the response byte limit.")
+            if truncated or size + line_size > MAX_RESPONSE_BYTES or len(selected) >= MAX_TEXT_LINES:
+                if next_line is None:
+                    next_line = total
+                truncated = True
+                continue
+            selected.append(line)
+            size += line_size
+    return {"total_lines": total, "content": "".join(selected), "truncated": truncated, "next_line": next_line}
 
 
 class UserFS:
@@ -148,13 +190,23 @@ class UserFS:
         """Read raw bytes from *path*."""
         self._check_path(path)
         async with aiofiles.open(path, "rb") as f:
-            return await f.read()
+            data = await f.read(MAX_RESPONSE_BYTES + 1)
+            if len(data) > MAX_RESPONSE_BYTES:
+                raise ResourceLimitError("File exceeds the in-memory read limit; use a streamed download.")
+            return data
 
     async def read_text(self, path: str, encoding: str = "utf-8") -> str:
         """Read text from *path*."""
         self._check_path(path)
         async with aiofiles.open(path, "r", encoding=encoding, errors="strict") as f:
-            return await f.read()
+            text = await f.read(MAX_RESPONSE_BYTES + 1)
+            if len(text.encode(encoding)) > MAX_RESPONSE_BYTES or text.count("\n") > MAX_TEXT_LINES:
+                raise ResourceLimitError("Text exceeds the editing/read limit; use a smaller file or line range.")
+            return text
+
+    async def read_lines(self, path, start_line=None, end_line=None):
+        self._check_path(path)
+        return await run_io(read_text_range, path, start_line, end_line)
 
     async def exists(self, path: str) -> bool:
         """Check if *path* exists."""
@@ -204,7 +256,13 @@ class UserFS:
         self._check_path(path)
         def _list_sync():
             entries = []
-            for name in sorted(os.listdir(path)):
+            with os.scandir(path) as scan:
+                names = []
+                for entry in scan:
+                    if len(names) >= MAX_SEARCH_ENTRIES:
+                        raise ResourceLimitError("Directory contains too many entries; narrow the path.")
+                    names.append(entry.name)
+            for name in sorted(names):
                 full = os.path.join(path, name)
                 if not self.is_path_allowed(full):
                     continue
@@ -220,7 +278,7 @@ class UserFS:
                 except OSError:
                     continue
             return entries
-        return await asyncio.to_thread(_list_sync)
+        return await run_io(_list_sync)
 
     async def walk(self, path: str) -> list[tuple[str, list[str], list[str]]]:
         """Walk directory tree. Returns list of (dirpath, dirnames, filenames).
@@ -230,21 +288,16 @@ class UserFS:
         """
         self._check_path(path)
         def _walk_filtered():
-            result = []
-            for dirpath, dirnames, filenames in os.walk(path):
-                # Prune directories belonging to other users (in-place
-                # modification prevents os.walk from descending into them).
-                dirnames[:] = [
-                    d for d in dirnames
-                    if self.is_path_allowed(os.path.join(dirpath, d))
-                ]
-                filenames = [
-                    f for f in filenames
-                    if self.is_path_allowed(os.path.join(dirpath, f))
-                ]
-                result.append((dirpath, dirnames, filenames))
-            return result
-        return await asyncio.to_thread(_walk_filtered)
+            from open_terminal.utils.search import walk_entries
+            directories = {path: ([], [])}
+            for full, kind in walk_entries(self, path):
+                parent = os.path.dirname(full)
+                dirs, files = directories.setdefault(parent, ([], []))
+                (dirs if kind == "directory" else files).append(os.path.basename(full))
+                if kind == "directory":
+                    directories.setdefault(full, ([], []))
+            return [(directory, dirs, files) for directory, (dirs, files) in directories.items()]
+        return await run_io(_walk_filtered)
 
     # ------------------------------------------------------------------
     # Write operations (native Python + chown for correct ownership)

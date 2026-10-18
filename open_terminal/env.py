@@ -90,7 +90,7 @@ EXECUTE_DESCRIPTION = os.environ.get(
 )
 
 # Maximum size (in bytes) for per-process JSONL log files.
-# Once exceeded, logging stops for that process (the process keeps running).
+# Once exceeded, the oldest portion is removed on disk; output capture continues.
 MAX_PROCESS_LOG_SIZE = int(
     os.environ.get(
         "OPEN_TERMINAL_MAX_LOG_SIZE",
@@ -99,7 +99,7 @@ MAX_PROCESS_LOG_SIZE = int(
 )
 
 # How long (in seconds) to keep finished-process log files on disk.
-# After this period, _cleanup_expired() will delete the log file.
+# A periodic disk sweep removes expired logs independently of process records.
 PROCESS_LOG_RETENTION: float = float(
     os.environ.get(
         "OPEN_TERMINAL_LOG_RETENTION",

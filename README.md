@@ -152,6 +152,67 @@ You can also point to a specific config file:
 open-terminal run --config /path/to/my-config.toml
 ```
 
+### Memory and execution budgets
+
+File downloads and proxy traffic stream in chunks. Uploads and generated ZIP/PDF
+files use temporary files, removed on completion or cancellation. Command logs
+rotate on disk without reading the whole log into memory.
+
+Text and log reads return bounded pages. When `truncated` is true, continue text
+reads from `next_line` or log reads from `next_offset`. Explicit log `tail` reads
+return the newest output and can skip older entries. Download a file through
+`/files/view` when you need its complete original bytes.
+
+These settings accept positive integers, through TOML keys or the corresponding
+`OPEN_TERMINAL_` environment variable (for example, `OPEN_TERMINAL_MAX_PROCESSES`):
+
+| TOML key | Default | Scope |
+|---|---:|---|
+| `max_response_bytes` | 1048576 | Text/log content per page and notebook output budget |
+| `max_request_bytes` | 2097152 | Ordinary HTTP request bodies |
+| `max_transfer_bytes` | 1073741824 | Upload/proxy request bodies and uncompressed ZIP input |
+| `max_concurrent_requests` | 8 | Active HTTP requests, including streaming responses; health checks are exempt |
+| `max_processes` | 8 | Active background commands |
+| `max_notebooks` | 2 | Notebook sessions, including kernels starting up |
+| `max_command_seconds` | 3600 | Background command lifetime; separate from the output wait timeout |
+| `worker_memory_bytes` | 536870912 | Linux address-space limit for document workers only |
+
+Excess concurrency returns HTTP 429 instead of queuing work. Oversized inputs
+return 413. JSON bodies are also checked for excessive nesting/object counts
+before parsing. Background commands that exceed their deadline stop with an
+`error` in their status response. Log I/O failures are reported there too; output
+is still drained and the command's completion state is finalized.
+
+Directory scans examine at most 10,000 entries; content search scans at most
+32 MiB, returns bounded snippets, and skips lines longer than 64 KiB. Narrow the
+search path when it exceeds these budgets. Text editing is limited to the text
+response budget and 50,000 lines. Text reads reject individual lines longer than
+64 KiB. Document extraction allows up to 16 MiB of input/expanded ZIP content,
+2 million extracted characters, and 100,000 spreadsheet cells. Two document
+workers may run concurrently, with a 60-second deadline and bounded output.
+Limits are per server process; additional server workers multiply them.
+
+Notebook kernels are stopped on cancelled execution, excessive output, or failed
+startup, and idle sessions expire after 30 minutes. Ordinary Python cell errors
+preserve the session. Unattached terminals expire after 60 seconds; connected
+terminals remain available until they disconnect, exit, or are deleted. Terminal
+I/O uses backpressure; Open Terminal does not override Uvicorn's WebSocket message
+size or queue settings.
+
+Arbitrary shell/notebook code needs OS-level isolation to keep its allocations
+from exhausting the API container. On Linux, `OPEN_TERMINAL_WORKLOAD_CGROUP` can
+point to an existing, writable cgroup v2 directory with a finite `memory.max`.
+Launched commands, terminals, kernels, and document workers join that group
+before executing; keep the API outside it. Configure an aggregate memory budget
+that leaves room for the API, plus `pids.max` and `memory.swap.max` as appropriate.
+The host/container supervisor must delegate that cgroup and grant access to the
+worker users; Open Terminal does not create or modify host cgroups. Without it,
+command/session admission limits do **not** bound arbitrary child allocations
+or forks. A memory limit on the entire container alone can still kill the API.
+The document address-space limit is Linux-only; macOS and Windows retain the
+application budgets but require platform isolation for hard workload memory
+limits.
+
 ### File Browser Root
 
 Open Terminal reports file-browser root metadata from `GET /files/cwd` so clients can hide parent navigation above a friendly starting point.

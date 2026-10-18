@@ -150,5 +150,7 @@ def resolve_user(user_id: str) -> tuple[str, str]:
 
     username = sanitize_username(user_id)
     home_dir = ensure_os_user(username)
+    if len(_user_cache) >= 1024:
+        _user_cache.pop(next(iter(_user_cache)))
     _user_cache[user_id] = (username, home_dir)
     return username, home_dir

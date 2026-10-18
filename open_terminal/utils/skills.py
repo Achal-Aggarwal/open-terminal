@@ -57,6 +57,8 @@ async def list_skill_resources(fs: UserFS, skill_dir: str) -> list[str]:
         if depth >= MAX_SKILL_RESOURCE_DEPTH or len(resources) >= MAX_SKILL_RESOURCE_FILES:
             return
         for entry in await fs.listdir(directory):
+            if len(resources) >= MAX_SKILL_RESOURCE_FILES:
+                break
             name = str(entry.get("name") or "")
             if not name or name.startswith(".") or name == "SKILL.md":
                 continue

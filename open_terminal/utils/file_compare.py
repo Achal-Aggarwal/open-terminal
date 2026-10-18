@@ -1,6 +1,5 @@
 """Read-only text comparison. Workers receive structured input on stdin."""
 
-import asyncio
 import difflib
 import json
 import mimetypes
@@ -8,6 +7,8 @@ import os
 from pathlib import Path
 import re
 import sys
+
+from open_terminal.utils.limits import MAX_DOCUMENT_BYTES, run_worker
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
@@ -20,7 +21,7 @@ from open_terminal.utils.documents import (
 )
 
 TIMEOUT_SECONDS = 60
-MAX_FILE_BYTES = 50 * 1024 * 1024
+MAX_FILE_BYTES = MAX_DOCUMENT_BYTES
 MAX_TEXT_CHARS = 2_000_000
 MAX_LINES = 50_000
 
@@ -35,7 +36,7 @@ def extract(path):
     name = Path(path).name
     try:
         if os.path.getsize(path) > MAX_FILE_BYTES:
-            raise ValueError("File exceeds the 50 MiB comparison limit.")
+            raise ValueError("File exceeds the document comparison size limit.")
         mime = mimetypes.guess_type(path)[0]
         notices = []
         extractor = next(
@@ -89,8 +90,10 @@ def extract(path):
             if any(ord(c) < 32 and c not in "\n\r\t\f" for c in text):
                 raise ValueError("Unsupported binary file.")
         text = text.replace("\r\n", "\n").replace("\r", "\n")
+        if len(text) > MAX_TEXT_CHARS or text.count("\n") >= MAX_LINES:
+            raise ValueError("Extracted text exceeds the comparison limit.")
         lines = text.splitlines()
-        if len(text) > MAX_TEXT_CHARS or len(lines) > MAX_LINES:
+        if len(lines) > MAX_LINES:
             raise ValueError(
                 "Extracted text exceeds the comparison limit (2 million characters / 50,000 lines). Nothing was truncated."
             )
@@ -213,63 +216,15 @@ async def run_comparison(request, payload, fs, cwd=None):
             }
         else:
             command = ["sudo", "-n", "-u", fs.username, "--", *command]
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        **process_options,
+    stdout = await run_worker(
+        command,
+        json.dumps({"original": paths[0], "revised": paths[1], "ignore_whitespace": payload.ignore_whitespace}).encode(),
+        request=request, timeout=TIMEOUT_SECONDS, **process_options,
     )
-    task = asyncio.create_task(
-        process.communicate(
-            json.dumps(
-                {
-                    "original": paths[0],
-                    "revised": paths[1],
-                    "ignore_whitespace": payload.ignore_whitespace,
-                }
-            ).encode()
-        )
-    )
-
-    async def disconnected():
-        # A blocking receive also works through Starlette's BaseHTTPMiddleware;
-        # is_disconnected() uses an immediately cancelled receive there.
-        while (await request.receive())["type"] != "http.disconnect":
-            pass
-
-    disconnect = asyncio.create_task(disconnected())
-    try:
-        done, _ = await asyncio.wait(
-            {task, disconnect},
-            timeout=TIMEOUT_SECONDS,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if not done:
-            raise TimeoutError()
-        if disconnect in done:
-            raise HTTPException(499, "Comparison cancelled.")
-        stdout, stderr = await task
-        if process.returncode:
-            raise HTTPException(
-                422,
-                "Comparison failed. Check that the document libraries are installed and the files are readable.",
-            )
-        result = json.loads(stdout)
-        if "error" in result:
-            raise HTTPException(422, result["error"])
-        return result
-    except TimeoutError as exc:
-        raise HTTPException(
-            408, "Comparison exceeded the 60 second limit. Try smaller files."
-        ) from exc
-    finally:
-        if process.returncode is None:
-            process.kill()
-        await process.wait()
-        task.cancel()
-        disconnect.cancel()
-        await asyncio.gather(task, disconnect, return_exceptions=True)
+    result = json.loads(stdout)
+    if "error" in result:
+        raise HTTPException(422, result["error"])
+    return result
 
 
 if __name__ == "__main__":
