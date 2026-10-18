@@ -740,7 +740,7 @@ async def read_file(
 
     fs._check_path(target)
     try:
-        return await run_io(text_file_response, target, target, start_line, end_line)
+        return await text_file_response(target, target, start_line, end_line)
     except UnicodeDecodeError:
         pass
 
@@ -759,7 +759,7 @@ async def read_file(
             ))
             if "error" in result:
                 raise ValueError(result["error"])
-            return await run_io(text_file_response, extracted_path, target, start_line, end_line)
+            return await text_file_response(extracted_path, target, start_line, end_line, False)
         finally:
             os.unlink(extracted_path)
     if any(mime.startswith(prefix) for prefix in BINARY_FILE_MIME_PREFIXES):
@@ -1381,26 +1381,21 @@ async def upload_file(
     filename = os.path.basename(file.filename or "upload")
     directory = fs.resolve_path(directory)
     path = os.path.normpath(os.path.join(directory, filename))
-    temporary = None
     size = 0
     try:
         fs._check_path(path)
         await fs.mkdir(directory)
-        fd, temporary = tempfile.mkstemp(dir=directory, prefix=".upload-")
-        os.close(fd)
-        async with aiofiles.open(temporary, "wb") as output:
+        async with aiofiles.open(path, "wb") as output:
             while chunk := await file.read(CHUNK_SIZE):
                 size += len(chunk)
                 await output.write(chunk)
-        await fs._chown(temporary)
-        await aiofiles.os.replace(temporary, path)
+        await fs._chown(path)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc))
+    except OSError as exc:
+        raise HTTPException(400, str(exc))
     finally:
         await form.close()
-        if temporary:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
     return {"path": path, "size": size}
 
 
@@ -1454,7 +1449,9 @@ async def archive_paths(
                     if stop.is_set():
                         return
                     arcname = os.path.basename(full) if full == target else os.path.join(os.path.basename(target.rstrip("/\\")) or "dir", os.path.relpath(full, target))
-                    with open(full, "rb") as source, archive.open(arcname, "w") as destination:
+                    info = zipfile.ZipInfo.from_file(full, arcname)
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    with open(full, "rb") as source, archive.open(info, "w", force_zip64=True) as destination:
                         while chunk := source.read(CHUNK_SIZE):
                             if stop.is_set():
                                 return

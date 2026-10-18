@@ -40,13 +40,18 @@ class TemporaryFileResponse(FileResponse):
                 pass
 
 
-_LINE_BREAK = re.compile(r"[\n\v\f\x1c-\x1e\x85\u2028\u2029]")
+_LINE_BREAK = re.compile(r"\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
 def text_chunks(source):
     """Yield splitlines-compatible line numbers and bounded pieces of text."""
     number = 1
+    pending = ""
     for chunk in iter(lambda: source.read(CHUNK_SIZE), ""):
+        chunk = pending + chunk
+        pending = "\r" if chunk.endswith("\r") else ""
+        if pending:
+            chunk = chunk[:-1]
         start = 0
         for match in _LINE_BREAK.finditer(chunk):
             end = match.end()
@@ -55,6 +60,8 @@ def text_chunks(source):
             start = end
         if start < len(chunk):
             yield number, chunk[start:]
+    if pending:
+        yield number, pending
 
 
 def read_text_range(path, start_line=None, end_line=None):
@@ -67,11 +74,11 @@ def read_text_range(path, start_line=None, end_line=None):
     return {"total_lines": total, "content": selected.getvalue()}
 
 
-def text_file_response(path, display_path, start_line=None, end_line=None):
+def _build_text_file_response(path, display_path, start_line=None, end_line=None, normalize_newlines=True):
     """Build the original JSON response on disk, including arbitrarily long lines."""
     fd, temporary = tempfile.mkstemp(suffix=".json")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as output, open(path, encoding="utf-8") as source:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as output, open(path, encoding="utf-8", newline=None if normalize_newlines else "") as source:
             output.write('{"path":' + json.dumps(display_path) + ',"content":"')
             total = 0
             for total, chunk in text_chunks(source):
@@ -81,6 +88,20 @@ def text_file_response(path, display_path, start_line=None, end_line=None):
         return TemporaryFileResponse(temporary, media_type="application/json")
     except BaseException:
         os.unlink(temporary)
+        raise
+
+
+async def text_file_response(*args):
+    task = asyncio.create_task(asyncio.to_thread(_build_text_file_response, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            response = await task
+        except Exception:
+            pass
+        else:
+            os.unlink(response.path)
         raise
 
 
