@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import sys
 
-from open_terminal.utils.limits import MAX_DOCUMENT_BYTES, run_worker
+from open_terminal.utils.limits import run_worker
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
@@ -21,7 +21,7 @@ from open_terminal.utils.documents import (
 )
 
 TIMEOUT_SECONDS = 60
-MAX_FILE_BYTES = MAX_DOCUMENT_BYTES
+MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_TEXT_CHARS = 2_000_000
 MAX_LINES = 50_000
 
@@ -36,7 +36,7 @@ def extract(path):
     name = Path(path).name
     try:
         if os.path.getsize(path) > MAX_FILE_BYTES:
-            raise ValueError("File exceeds the document comparison size limit.")
+            raise ValueError("File exceeds the 50 MiB comparison limit.")
         mime = mimetypes.guess_type(path)[0]
         notices = []
         extractor = next(
@@ -90,7 +90,7 @@ def extract(path):
             if any(ord(c) < 32 and c not in "\n\r\t\f" for c in text):
                 raise ValueError("Unsupported binary file.")
         text = text.replace("\r\n", "\n").replace("\r", "\n")
-        if len(text) > MAX_TEXT_CHARS or text.count("\n") >= MAX_LINES:
+        if len(text) > MAX_TEXT_CHARS:
             raise ValueError("Extracted text exceeds the comparison limit.")
         lines = text.splitlines()
         if len(lines) > MAX_LINES:

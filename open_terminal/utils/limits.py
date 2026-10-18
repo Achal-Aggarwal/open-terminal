@@ -1,7 +1,6 @@
 """Memory budgets shared by HTTP handlers and subprocess workers."""
 
 import asyncio
-from contextlib import contextmanager
 import os
 from pathlib import Path
 import sys
@@ -24,38 +23,10 @@ MAX_RESPONSE_BYTES = positive_setting("max_response_bytes", 1024 * 1024)
 MAX_REQUEST_BYTES = positive_setting("max_request_bytes", 2 * 1024 * 1024)
 MAX_TRANSFER_BYTES = positive_setting("max_transfer_bytes", 1024 * 1024 * 1024)
 MAX_COMMAND_SECONDS = positive_setting("max_command_seconds", 3600)
-WORKER_MEMORY_BYTES = positive_setting("worker_memory_bytes", 512 * 1024 * 1024)
-MAX_SEARCH_ENTRIES = 10_000
-MAX_SEARCH_BYTES = 32 * 1024 * 1024
-MAX_TEXT_LINES = 50_000
-MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
-MAX_DOCUMENT_CHARS = 2_000_000
-MAX_DOCUMENT_CELLS = 100_000
 
 
 class ResourceLimitError(ValueError):
     pass
-
-
-class Capacity:
-    """Reject excess work instead of building an unbounded waiter queue."""
-
-    def __init__(self, limit: int):
-        self.limit = limit
-        self.active = 0
-
-    @contextmanager
-    def acquire(self):
-        if self.active >= self.limit:
-            raise HTTPException(429, "Too many active operations; retry after one finishes.")
-        self.active += 1
-        try:
-            yield
-        finally:
-            self.active -= 1
-
-
-document_jobs = Capacity(2)
 
 
 async def run_io(function, *args):
@@ -82,7 +53,7 @@ class ResourceLimitsMiddleware:
             cleaned = [(key, value) for key, value in params if value.lower() != "null"]
             if len(cleaned) != len(params):
                 scope = {**scope, "query_string": urlencode(cleaned).encode()}
-        if scope["type"] != "http" or scope["path"] == "/health":
+        if scope["type"] != "http" or (scope["path"] == "/health" or scope["path"].startswith(("/files/", "/skills"))):
             return await self.app(scope, receive, send)
         limit = MAX_TRANSFER_BYTES if scope["path"] == "/files/upload" or scope["path"].startswith("/proxy/") else MAX_REQUEST_BYTES
         headers = dict(scope.get("headers", []))
@@ -150,68 +121,64 @@ def worker_command(command: list[str], *, memory_limit: int = 0) -> list[str]:
     return [sys.executable, str(Path(__file__).with_name("worker.py")), str(memory_limit), cgroup, *command]
 
 
-async def run_worker(command, payload=None, *, request=None, timeout=60, output_limit=8 * 1024 * 1024, **options):
-    """Run document work with bounded output, concurrency, and cancellation."""
+async def run_worker(command, payload=None, *, request=None, timeout=60, **options):
+    """Run document work with cancellation and process-group cleanup."""
     import signal
     import subprocess
 
-    with document_jobs.acquire():
-        worker_env = dict(options.pop("env", os.environ))
-        # Extraction does not need BLAS parallelism. Its thread stacks and
-        # arenas alone can exhaust an address-space budget during import.
-        worker_env.update(OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", MALLOC_ARENA_MAX="2")
-        process = await asyncio.create_subprocess_exec(
-            *worker_command(command, memory_limit=WORKER_MEMORY_BYTES), stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE, stderr=subprocess.DEVNULL,
-            start_new_session=os.name != "nt", env=worker_env, **options,
+    worker_env = dict(options.pop("env", os.environ))
+    # Document extraction does not need BLAS parallelism.
+    worker_env.update(OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", MALLOC_ARENA_MAX="2")
+    process = await asyncio.create_subprocess_exec(
+        *worker_command(command), stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=subprocess.DEVNULL,
+        start_new_session=os.name != "nt", env=worker_env, **options,
+    )
+
+    async def exchange():
+        if payload:
+            process.stdin.write(payload)
+            await process.stdin.drain()
+        process.stdin.close()
+        output = bytearray()
+        while chunk := await process.stdout.read(CHUNK_SIZE):
+            output.extend(chunk)
+        await process.wait()
+        if process.returncode:
+            raise HTTPException(422, "Document worker failed. Check that the document libraries are installed and the files are readable.")
+        return bytes(output)
+
+    async def disconnected():
+        while (await request.receive())["type"] != "http.disconnect":
+            pass
+
+    task = asyncio.create_task(exchange())
+    disconnect = asyncio.create_task(disconnected()) if request else None
+    try:
+        done, _ = await asyncio.wait(
+            {task, disconnect} if disconnect else {task},
+            timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
         )
-
-        async def exchange():
-            if payload:
-                process.stdin.write(payload)
-                await process.stdin.drain()
-            process.stdin.close()
-            output = bytearray()
-            while chunk := await process.stdout.read(CHUNK_SIZE):
-                if len(output) + len(chunk) > output_limit:
-                    raise ResourceLimitError("Document worker output exceeds the size limit.")
-                output.extend(chunk)
-            await process.wait()
-            if process.returncode:
-                raise ResourceLimitError("Document worker failed or exceeded its memory limit.")
-            return bytes(output)
-
-        async def disconnected():
-            while (await request.receive())["type"] != "http.disconnect":
+        if not done:
+            raise HTTPException(408, "Document operation exceeded its execution deadline.")
+        if disconnect and disconnect in done:
+            raise HTTPException(499, "Document operation cancelled.")
+        return await task
+    finally:
+        if os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
                 pass
-
-        task = asyncio.create_task(exchange())
-        disconnect = asyncio.create_task(disconnected()) if request else None
-        try:
-            done, _ = await asyncio.wait(
-                {task, disconnect} if disconnect else {task},
-                timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
-            )
-            if not done:
-                raise HTTPException(408, "Document operation exceeded its execution deadline.")
-            if disconnect and disconnect in done:
-                raise HTTPException(499, "Document operation cancelled.")
-            return await task
-        finally:
-            if os.name != "nt":
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            elif process.returncode is None:
-                process.kill()
-            task.cancel()
-            if disconnect:
-                disconnect.cancel()
-            await asyncio.gather(*([task, disconnect] if disconnect else [task]), return_exceptions=True)
-            process.stdin.close()
-            # A paused stdout transport can keep Process.wait() pending even
-            # after SIGKILL. Discard remaining bounded pipe chunks before reaping.
-            while await process.stdout.read(CHUNK_SIZE):
-                pass
-            await process.wait()
+        elif process.returncode is None:
+            process.kill()
+        task.cancel()
+        if disconnect:
+            disconnect.cancel()
+        await asyncio.gather(*([task, disconnect] if disconnect else [task]), return_exceptions=True)
+        process.stdin.close()
+        # A paused stdout transport can keep Process.wait() pending even
+        # after SIGKILL. Discard remaining bounded pipe chunks before reaping.
+        while await process.stdout.read(CHUNK_SIZE):
+            pass
+        await process.wait()

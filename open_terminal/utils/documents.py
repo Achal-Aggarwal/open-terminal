@@ -8,64 +8,46 @@ All libraries used are permissively licensed (MIT / BSD).
 """
 
 import zipfile
-import os
 from functools import wraps
 
-from open_terminal.utils.limits import (
-    MAX_DOCUMENT_BYTES, MAX_DOCUMENT_CHARS, MAX_DOCUMENT_CELLS,
-    MAX_TEXT_LINES, ResourceLimitError,
-)
+
+def text_extractor(separator="\n"):
+    def decorate(function):
+        @wraps(function)
+        def extract(*args, **kwargs):
+            return separator.join(function(*args, **kwargs))
+
+        def write_to(path, output):
+            first = True
+            for part in function(path):
+                if not first:
+                    output.write(separator)
+                output.write(part)
+                first = False
+        extract.write_to = write_to
+        return extract
+    return decorate
 
 
-class TextParts(list):
-    def __init__(self):
-        super().__init__()
-        self.characters = 0
-
-    def append(self, value):
-        self.characters += len(value) + 2
-        if self.characters > MAX_DOCUMENT_CHARS or len(self) >= MAX_TEXT_LINES:
-            raise ResourceLimitError("Document text exceeds the extraction limit.")
-        super().append(value)
-
-
-def bounded_extractor(function):
-    @wraps(function)
-    def extract(path, *args, **kwargs):
-        if os.path.getsize(path) > MAX_DOCUMENT_BYTES:
-            raise ResourceLimitError("Document exceeds the input size limit.")
-        if zipfile.is_zipfile(path):
-            with zipfile.ZipFile(path) as archive:
-                if len(archive.infolist()) > 10_000 or sum(info.file_size for info in archive.infolist()) > MAX_DOCUMENT_BYTES:
-                    raise ResourceLimitError("Expanded document exceeds the extraction limit.")
-        text = function(path, *args, **kwargs)
-        if len(text) > MAX_DOCUMENT_CHARS:
-            raise ResourceLimitError("Document text exceeds the extraction limit.")
-        return text
-    return extract
-
-
-
-@bounded_extractor
+@text_extractor()
 def extract_pdf(file_path: str, strict: bool = False) -> str:
-    """Extract text from a PDF file."""
+    """Extract PDF pages without retaining every page's text."""
     from pypdf import PdfReader
 
     reader = PdfReader(file_path)
     if strict and reader.is_encrypted:
         raise ValueError("Encrypted PDF. Provide an unencrypted copy.")
-    pages = TextParts()
-    for page in reader.pages:
-        pages.append(page.extract_text() or "")
-    missing = [str(i) for i, text in enumerate(pages, 1) if not text.strip()]
-    if strict and missing:
-        raise ValueError(
-            f"No extractable text on PDF pages {', '.join(missing)}. OCR is required before comparison."
-        )
-    return "\n".join(pages)
+    missing = []
+    for index, page in enumerate(reader.pages, 1):
+        text = page.extract_text() or ""
+        if strict and not text.strip():
+            missing.append(str(index))
+        yield text
+    if missing:
+        raise ValueError(f"No extractable text on PDF pages {', '.join(missing)}. OCR is required before comparison.")
 
 
-@bounded_extractor
+@text_extractor()
 def extract_docx(file_path: str) -> str:
     """Extract current paragraph/table text, including tracked insertions, without saving."""
     from docx import Document as DocxDocument
@@ -94,57 +76,46 @@ def extract_docx(file_path: str) -> str:
                 if child.tag != qn("w:pPr"):
                     paragraph.append(child)
             following.getparent().remove(following)
-    parts = TextParts()
+
     for child in doc.element.body:
         if child.tag.endswith("}p"):
-            parts.append(Paragraph(child, doc).text)
+            yield (Paragraph(child, doc).text)
         elif child.tag.endswith("}tbl"):
             for row in Table(child, doc).rows:
-                parts.append("\t".join(cell.text for cell in row.cells))
-    return "\n".join(parts)
+                yield ("\t".join(cell.text for cell in row.cells))
 
 
-@bounded_extractor
+
+@text_extractor()
 def extract_xlsx(file_path: str) -> str:
-    """Extract text from an Excel (.xlsx) file."""
+    """Extract spreadsheet rows incrementally, including sparse cell ranges."""
     from openpyxl import load_workbook
 
-    wb = load_workbook(file_path, read_only=True, data_only=True)
-    parts = TextParts()
-    cells = 0
+    workbook = load_workbook(file_path, read_only=True, data_only=True)
     try:
-        for sheet in wb.worksheets:
-            cells += (sheet.max_row or 0) * (sheet.max_column or 0)
-            if cells > MAX_DOCUMENT_CELLS:
-                raise ResourceLimitError("Spreadsheet cell range exceeds the extraction limit.")
-            parts.append(f"--- {sheet.title} ---")
-            visited = 0
+        for sheet in workbook.worksheets:
+            yield f"--- {sheet.title} ---"
             for row in sheet.iter_rows(values_only=True):
-                visited += len(row)
-                if visited > MAX_DOCUMENT_CELLS:
-                    raise ResourceLimitError("Spreadsheet cell range exceeds the extraction limit.")
-                parts.append("\t".join(str(c) if c is not None else "" for c in row))
-        return "\n".join(parts)
+                yield "\t".join(str(cell) if cell is not None else "" for cell in row)
     finally:
-        wb.close()
+        workbook.close()
 
 
-@bounded_extractor
+@text_extractor()
 def extract_pptx(file_path: str) -> str:
     """Extract text from a PowerPoint (.pptx) file."""
     from pptx import Presentation
 
     prs = Presentation(file_path)
-    parts = TextParts()
+
     for i, slide in enumerate(prs.slides, 1):
-        parts.append(f"--- Slide {i} ---")
+        yield (f"--- Slide {i} ---")
         for shape in slide.shapes:
             if shape.has_text_frame:
-                parts.append(shape.text_frame.text)
-    return "\n".join(parts)
+                yield (shape.text_frame.text)
 
 
-@bounded_extractor
+
 def extract_rtf(file_path: str) -> str:
     """Extract text from a Rich Text Format (.rtf) file."""
     from striprtf.striprtf import rtf_to_text
@@ -154,26 +125,23 @@ def extract_rtf(file_path: str) -> str:
     return rtf_to_text(raw.decode("utf-8", errors="replace"))
 
 
-@bounded_extractor
+@text_extractor()
 def extract_xls(file_path: str) -> str:
     """Extract text from a legacy Excel (.xls) file."""
     import xlrd
 
     wb = xlrd.open_workbook(file_path)
-    parts = TextParts()
-    if sum(sheet.nrows * sheet.ncols for sheet in wb.sheets()) > MAX_DOCUMENT_CELLS:
-        raise ResourceLimitError("Spreadsheet cell range exceeds the extraction limit.")
+
     for sheet in wb.sheets():
-        parts.append(f"--- {sheet.name} ---")
+        yield (f"--- {sheet.name} ---")
         for row_idx in range(sheet.nrows):
-            parts.append("\t".join(
+            yield ("\t".join(
                 str(sheet.cell_value(row_idx, col_idx))
                 for col_idx in range(sheet.ncols)
             ))
-    return "\n".join(parts)
 
 
-@bounded_extractor
+
 def extract_odt(file_path: str) -> str:
     """Extract text from an OpenDocument Text (.odt) file."""
     from lxml import etree
@@ -188,7 +156,7 @@ def extract_odt(file_path: str) -> str:
     )
 
 
-@bounded_extractor
+@text_extractor()
 def extract_ods(file_path: str) -> str:
     """Extract text from an OpenDocument Spreadsheet (.ods) file."""
     from lxml import etree
@@ -198,10 +166,10 @@ def extract_ods(file_path: str) -> str:
             tree = etree.parse(f)
     ns_table = "urn:oasis:names:tc:opendocument:xmlns:table:1.0"
     ns_text = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
-    parts = TextParts()
+
     for table in tree.iter(f"{{{ns_table}}}table"):
         name = table.get(f"{{{ns_table}}}name", "Sheet")
-        parts.append(f"--- {name} ---")
+        yield (f"--- {name} ---")
         for row in table.iter(f"{{{ns_table}}}table-row"):
             cells = []
             for cell in row.iter(f"{{{ns_table}}}table-cell"):
@@ -210,11 +178,11 @@ def extract_ods(file_path: str) -> str:
                     for p in cell.iter(f"{{{ns_text}}}p")
                 )
                 cells.append(cell_text)
-            parts.append("\t".join(cells))
-    return "\n".join(parts)
+            yield ("\t".join(cells))
 
 
-@bounded_extractor
+
+@text_extractor()
 def extract_odp(file_path: str) -> str:
     """Extract text from an OpenDocument Presentation (.odp) file."""
     from lxml import etree
@@ -224,22 +192,22 @@ def extract_odp(file_path: str) -> str:
             tree = etree.parse(f)
     ns_draw = "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
     ns_text = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
-    parts = TextParts()
+
     for i, page in enumerate(tree.iter(f"{{{ns_draw}}}page"), 1):
-        parts.append(f"--- Slide {i} ---")
+        yield (f"--- Slide {i} ---")
         for p in page.iter(f"{{{ns_text}}}p"):
             text = "".join(p.itertext()).strip()
             if text:
-                parts.append(text)
-    return "\n".join(parts)
+                yield (text)
 
 
-@bounded_extractor
+
+@text_extractor("\n\n")
 def extract_epub(file_path: str, strict: bool = False) -> str:
     """Extract text from an EPUB e-book."""
     from lxml import etree
 
-    parts = TextParts()
+
     with zipfile.ZipFile(file_path) as zf:
         # Parse the container to find the root file
         with zf.open("META-INF/container.xml") as cf:
@@ -272,7 +240,7 @@ def extract_epub(file_path: str, strict: bool = False) -> str:
                         body = html_tree.find(".//body")
                         if body is not None:
                             text = "".join(body.itertext())
-                            parts.append(text.strip())
+                            yield (text.strip())
                 except (KeyError, etree.XMLSyntaxError):
                     if strict:
                         raise ValueError(f"Could not extract EPUB chapter: {item_path}")
@@ -286,15 +254,15 @@ def extract_epub(file_path: str, strict: bool = False) -> str:
                             body = html_tree.find(".//body")
                             if body is not None:
                                 text = "".join(body.itertext())
-                                parts.append(text.strip())
+                                yield (text.strip())
                     except etree.XMLSyntaxError:
                         if strict:
                             raise ValueError(f"Could not extract EPUB chapter: {name}")
                         continue
-    return "\n\n".join(parts)
 
 
-@bounded_extractor
+
+@text_extractor()
 def extract_eml(file_path: str) -> str:
     """Extract text from an email message (.eml)."""
     import email
@@ -302,12 +270,12 @@ def extract_eml(file_path: str) -> str:
 
     with open(file_path, "rb") as f:
         msg = email.message_from_binary_file(f, policy=policy.default)
-    parts = TextParts()
+
     for header in ("From", "To", "Cc", "Date", "Subject"):
         val = msg.get(header)
         if val:
-            parts.append(f"{header}: {val}")
-    parts.append("")  # blank line after headers
+            yield (f"{header}: {val}")
+    yield ("")  # blank line after headers
     body = msg.get_body(preferencelist=("plain", "html"))
     if body:
         content = body.get_content()
@@ -315,8 +283,8 @@ def extract_eml(file_path: str) -> str:
             from lxml import etree
             tree = etree.HTML(content)
             content = "".join(tree.itertext()) if tree is not None else content
-        parts.append(content)
-    return "\n".join(parts)
+        yield (content)
+
 
 
 # MIME type / extension → extractor mapping.
@@ -343,10 +311,16 @@ if __name__ == "__main__":
     import sys
 
     try:
-        path = json.load(sys.stdin)["path"]
+        payload = json.load(sys.stdin)
+        path = payload["path"]
         mime = mimetypes.guess_type(path)[0]
         extractor = next(fn for kind, suffix, fn in EXTRACTORS if kind and kind == mime or suffix and path.lower().endswith(suffix))
-        result = {"text": extractor(path)}
+        with open(payload["output"], "w", encoding="utf-8") as output:
+            if hasattr(extractor, "write_to"):
+                extractor.write_to(path, output)
+            else:
+                output.write(extractor(path))
+        result = {}
     except Exception as exc:
-        result = {"error": str(exc)[:1000]}
+        result = {"error": str(exc)}
     json.dump(result, sys.stdout)

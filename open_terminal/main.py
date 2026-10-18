@@ -1162,9 +1162,8 @@ async def match_files(
                         eligible = rg_matches(entry_path) if rg_matches is not None else size <= MAX_CONTENT_SEARCH_FILE_SIZE
                         if eligible:
                             with open(entry_path, "rb") as source:
-                                if b"\0" in source.read(8192):
-                                    continue
-                            for number, text in content_lines(entry_path):
+                                binary = b"\0" in source.read(8192)
+                            for number, text in (() if binary else content_lines(entry_path)):
                                 index = text.lower().find(query_lower)
                                 if index >= 0:
                                     content_matches.append({"line": number, "column": len(text[:index].encode("utf-16-le")) // 2 + 1, "text": text.rstrip("\r\n")})
