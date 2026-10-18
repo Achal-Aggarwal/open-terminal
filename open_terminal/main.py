@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner, read_pty, write_pty, PtyRunner
-from open_terminal.utils.fs import UserFS, TemporaryFileResponse, text_file_response
+from open_terminal.utils.fs import UserFS, TemporaryFileResponse, text_file_response, line_range_offsets
 from open_terminal.utils.limits import (CHUNK_SIZE, ResourceLimitError, ResourceLimitsMiddleware, run_io, run_worker, worker_command)
 from open_terminal.utils.file_compare import CompareRequest, run_comparison
 from open_terminal.utils.search import search_entries, walk_entries, matching_files, ranked_page
@@ -953,10 +953,8 @@ async def replace_file_content(http_request: Request, request: ReplaceRequest, f
 
     for chunk in request.replacements:
         if chunk.start_line or chunk.end_line:
-            lines = content.splitlines(keepends=True)
-            start = (chunk.start_line or 1) - 1
-            end = chunk.end_line or len(lines)
-            search_region = "".join(lines[start:end])
+            start, end = line_range_offsets(content, chunk.start_line, chunk.end_line)
+            search_region = content[start:end]
         else:
             search_region = content
 
@@ -974,8 +972,7 @@ async def replace_file_content(http_request: Request, request: ReplaceRequest, f
 
         if chunk.start_line or chunk.end_line:
             new_region = search_region.replace(chunk.target, chunk.replacement)
-            lines[start:end] = [new_region]
-            content = "".join(lines)
+            content = content[:start] + new_region + content[max(start, end):]
         else:
             content = content.replace(chunk.target, chunk.replacement)
 
@@ -1165,7 +1162,7 @@ async def match_files(
                         eligible = rg_matches(entry_path) if rg_matches is not None else size <= MAX_CONTENT_SEARCH_FILE_SIZE
                         if eligible:
                             with open(entry_path, "rb") as source:
-                                binary = b"\0" in source.read(8192)
+                                binary = rg_matches is None and b"\0" in source.read(8192)
                             for number, text in (() if binary else content_lines(entry_path)):
                                 index = text.lower().find(query_lower)
                                 if index >= 0:
@@ -1220,7 +1217,7 @@ async def search_files(
     def _search_sync():
         query_lower = query.strip().lower()
         def candidates():
-            for full_path, entry_type in search_entries(fs, target, show_hidden):
+            for full_path, entry_type in search_entries(fs, target, show_hidden, git_files_as_files=True):
                 if type != "any" and entry_type != type:
                     continue
                 name = os.path.basename(full_path)

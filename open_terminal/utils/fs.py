@@ -43,6 +43,22 @@ class TemporaryFileResponse(FileResponse):
 _LINE_BREAK = re.compile(r"\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
+def line_range_offsets(text, start_line=None, end_line=None):
+    start_boundary = (start_line or 1) - 1
+    start = 0 if start_boundary == 0 else len(text)
+    end = len(text)
+    last_boundary = max(start_boundary, end_line or 0)
+    if last_boundary:
+        for number, match in enumerate(_LINE_BREAK.finditer(text), 1):
+            if number == start_boundary:
+                start = match.end()
+            if number == end_line:
+                end = match.end()
+            if number >= last_boundary:
+                break
+    return start, end
+
+
 def text_chunks(source):
     """Yield splitlines-compatible line numbers and bounded pieces of text."""
     number = 1

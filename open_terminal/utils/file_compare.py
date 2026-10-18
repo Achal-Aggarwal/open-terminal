@@ -1,6 +1,7 @@
 """Read-only text comparison. Workers receive structured input on stdin."""
 
 import difflib
+import io
 import json
 import mimetypes
 import os
@@ -26,6 +27,14 @@ MAX_TEXT_CHARS = 2_000_000
 MAX_LINES = 50_000
 
 
+class ComparisonText(io.StringIO):
+    def write(self, text):
+        # CRLF normalization can halve the length; enforce the exact limit below.
+        if self.tell() + len(text) > 2 * MAX_TEXT_CHARS:
+            raise ValueError("Extracted text exceeds the comparison limit (2 million characters / 50,000 lines). Nothing was truncated.")
+        return super().write(text)
+
+
 class CompareRequest(BaseModel):
     original: str = Field(min_length=1)
     revised: str = Field(min_length=1)
@@ -48,7 +57,12 @@ def extract(path):
             None,
         )
         if extractor:
-            if extractor in (extract_pdf, extract_epub):
+            if hasattr(extractor, "write_to"):
+                output = ComparisonText()
+                options = {"strict": True} if extractor in (extract_pdf, extract_epub) else {}
+                extractor.write_to(path, output, **options)
+                text = output.getvalue()
+            elif extractor in (extract_pdf, extract_epub):
                 text = extractor(path, strict=True)
             else:
                 text = extractor(path)
@@ -92,11 +106,13 @@ def extract(path):
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         if len(text) > MAX_TEXT_CHARS:
             raise ValueError("Extracted text exceeds the comparison limit.")
-        lines = text.splitlines()
-        if len(lines) > MAX_LINES:
+        line_breaks = "\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+        line_count = sum(1 for _ in re.finditer("[" + line_breaks + "]", text)) + bool(text and text[-1] not in line_breaks)
+        if line_count > MAX_LINES:
             raise ValueError(
                 "Extracted text exceeds the comparison limit (2 million characters / 50,000 lines). Nothing was truncated."
             )
+        lines = text.splitlines()
         return {"path": path, "name": name, "notices": notices}, lines
     except Exception as exc:
         raise ValueError(f"{name}: {exc}") from exc

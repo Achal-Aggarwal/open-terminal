@@ -17,9 +17,9 @@ def text_extractor(separator="\n"):
         def extract(*args, **kwargs):
             return separator.join(function(*args, **kwargs))
 
-        def write_to(path, output):
+        def write_to(path, output, **kwargs):
             first = True
-            for part in function(path):
+            for part in function(path, **kwargs):
                 if not first:
                     output.write(separator)
                 output.write(part)
@@ -315,7 +315,7 @@ if __name__ == "__main__":
         path = payload["path"]
         mime = mimetypes.guess_type(path)[0]
         extractor = next(fn for kind, suffix, fn in EXTRACTORS if kind and kind == mime or suffix and path.lower().endswith(suffix))
-        with open(payload["output"], "w", encoding="utf-8") as output:
+        with open(payload["output"], "w", encoding="utf-8", newline="") as output:
             if hasattr(extractor, "write_to"):
                 extractor.write_to(path, output)
             else:

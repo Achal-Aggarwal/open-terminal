@@ -102,13 +102,8 @@ class ResourceLimitsMiddleware:
         await self.app(scope, limited_receive, send)
 
 
-def worker_command(command: list[str], *, memory_limit: int = 0) -> list[str]:
-    """Apply workload isolation before exec, without unsafe preexec_fn.
-
-    Address-space limits suit our document workers. General runtimes (Node,
-    JVM, scientific Python) reserve large virtual ranges and need a cgroup
-    budget on actual memory instead.
-    """
+def worker_command(command: list[str]) -> list[str]:
+    """Join the configured workload cgroup before exec, without preexec_fn."""
     if os.name == "nt":
         return command
     cgroup = os.environ.get("OPEN_TERMINAL_WORKLOAD_CGROUP", "")
@@ -116,9 +111,9 @@ def worker_command(command: list[str], *, memory_limit: int = 0) -> list[str]:
         path = Path(cgroup)
         if (path / "memory.max").read_text().strip() == "max":
             raise ValueError("OPEN_TERMINAL_WORKLOAD_CGROUP must have a finite memory.max")
-    if not memory_limit and not cgroup:
+    if not cgroup:
         return command
-    return [sys.executable, str(Path(__file__).with_name("worker.py")), str(memory_limit), cgroup, *command]
+    return [sys.executable, str(Path(__file__).with_name("worker.py")), cgroup, *command]
 
 
 async def run_worker(command, payload=None, *, request=None, timeout=60, **options):

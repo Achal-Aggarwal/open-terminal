@@ -158,37 +158,36 @@ File downloads and proxy traffic stream in chunks. Uploads and generated ZIP/PDF
 files use temporary files, removed on completion or cancellation. Command logs
 rotate on disk without reading the whole log into memory.
 
-Text and log reads return bounded pages. When `truncated` is true, continue text
-reads from `next_line` or log reads from `next_offset`. Explicit log `tail` reads
-return the newest output and can skip older entries. Download a file through
-`/files/view` when you need its complete original bytes.
+Text reads preserve the original `path`, `total_lines`, and `content` response,
+including complete long lines and the requested line range. The response is
+built on disk and streamed, without loading the entire source into a list of
+lines. Log reads return bounded pages; continue from `next_offset` when
+`truncated` is true. Explicit log `tail` reads return the newest output and can
+skip older entries.
 
 These settings accept positive integers, through TOML keys or the corresponding
 `OPEN_TERMINAL_` environment variable (for example, `OPEN_TERMINAL_MAX_RESPONSE_BYTES`):
 
 | TOML key | Default | Scope |
 |---|---:|---|
-| `max_response_bytes` | 1048576 | Text/log content per page and notebook output budget |
-| `max_request_bytes` | 2097152 | Ordinary HTTP request bodies |
-| `max_transfer_bytes` | 1073741824 | Upload/proxy request bodies and uncompressed ZIP input |
+| `max_response_bytes` | 1048576 | Log content per page and notebook output budget |
+| `max_request_bytes` | 2097152 | HTTP request bodies outside file/skill APIs |
+| `max_transfer_bytes` | 1073741824 | Proxy request bodies |
 | `max_command_seconds` | 3600 | Background command lifetime; separate from the output wait timeout |
-| `worker_memory_bytes` | 536870912 | Linux address-space limit for document workers only |
 
 Commands, notebook sessions, and HTTP requests have no global concurrency cap.
-Oversized inputs return 413. JSON bodies are also checked for excessive nesting/object counts
-before parsing. Background commands that exceed their deadline stop with an
+Outside file/skill APIs, oversized inputs return 413 and JSON bodies are
+checked for excessive nesting/object counts before parsing. Background commands that exceed their deadline stop with an
 `error` in their status response. Log I/O failures are reported there too; output
 is still drained and the command's completion state is finalized.
 
-Directory scans examine at most 10,000 entries; content search scans at most
-32 MiB, returns bounded snippets, and skips lines longer than 64 KiB. Narrow the
-search path when it exceeds these budgets. Text editing is limited to the text
-response budget and 50,000 lines. Text reads reject individual lines longer than
-64 KiB. Document extraction allows up to 16 MiB of input/expanded ZIP content,
-2 million extracted characters, and 100,000 spreadsheet cells. Two document
-workers may run concurrently, with a 60-second deadline and bounded output;
-additional document work returns HTTP 429.
-Limits are per server process; additional server workers multiply them.
+Searches preserve complete matching lines, ignore rules, ranking, and pagination.
+Git/ripgrep listings and ranked content matches use temporary disk storage rather
+than collecting the whole search in memory. File reads, edits, uploads, archives,
+and document extraction have no added size, line-count, cell-count, or scan caps.
+Document extraction writes text to a temporary file in a separate worker, with
+cleanup on completion or cancellation. File comparison retains its pre-existing
+50 MiB input, 2 million characters, 50,000 lines, and 60-second limits.
 
 Notebook kernels are stopped on cancelled execution, excessive output, or failed
 startup, and idle sessions expire after 30 minutes. Ordinary Python cell errors
@@ -207,9 +206,8 @@ The host/container supervisor must delegate that cgroup and grant access to the
 worker users; Open Terminal does not create or modify host cgroups. Without it,
 application budgets do **not** bound arbitrary child allocations or forks.
 A memory limit on the entire container alone can still kill the API.
-The document address-space limit is Linux-only; macOS and Windows retain the
-application budgets but require platform isolation for hard workload memory
-limits.
+Hard workload memory isolation requires support from the deployment platform;
+application streaming and cleanup cannot constrain arbitrary user programs.
 
 ### File Browser Root
 

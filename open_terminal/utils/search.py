@@ -43,7 +43,7 @@ def disk_database():
             db.close()
 
 
-def search_entries(fs, root, show_hidden=False):
+def search_entries(fs, root, show_hidden=False, *, git_files_as_files=False):
     with tempfile.TemporaryFile() as output:
         try:
             result = subprocess.run(
@@ -65,11 +65,13 @@ def search_entries(fs, root, show_hidden=False):
                 path = os.path.normpath(os.path.join(root, rel))
                 if not fs.is_path_allowed(path):
                     continue
+                leaf = path
                 while path != root and path.startswith(root.rstrip(os.sep) + os.sep):
                     if fs.is_path_allowed(path):
                         cursor = db.execute("INSERT OR IGNORE INTO entries VALUES (?)", (os.fsencode(path),))
                         if cursor.rowcount:
-                            yield path, "directory" if os.path.isdir(path) else "file"
+                            kind = "file" if git_files_as_files and path == leaf else "directory" if os.path.isdir(path) else "file"
+                            yield path, kind
                     path = os.path.dirname(path)
 
 
