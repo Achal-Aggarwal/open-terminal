@@ -3,6 +3,14 @@ import os
 from open_terminal import config
 
 
+def sanitized_environ(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Exclude inherited server settings; explicit command overrides still win."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("OPEN_TERMINAL_")}
+    if extra:
+        env.update(extra)
+    return env
+
+
 def _resolve_file_env(var: str, default: str = "") -> str:
     """Resolve an environment variable with Docker-secrets ``_FILE`` support.
 
