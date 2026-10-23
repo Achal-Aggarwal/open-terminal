@@ -235,6 +235,8 @@ docker run -d --name open-terminal -p 8000:8000 \
 
 Each user automatically gets a dedicated Linux account with its own home directory, so files, commands, and terminals stay in their own workspace and users do not walk over each other's work. Standard Unix permissions keep the workspaces apart in day-to-day use. They do not protect users from each other, and they are not meant to.
 
+In multi-user mode, requests that access a user's workspace must include `X-User-Id` alongside the API key. Missing user IDs return HTTP 400. `X-Session-Id` tracks the working directory separately for each user, so users can reuse a session ID without changing each other's working directory. Single-user mode does not require `X-User-Id`.
+
 ## API Docs
 
 Full interactive API documentation is available at [http://localhost:8000/docs](http://localhost:8000/docs) once your instance is running.
