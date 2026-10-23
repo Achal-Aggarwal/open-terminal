@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.14.4] - 2026-10-24
+
+### Added
+
+- Optional HTTP keep-alive timeout configuration through `OPEN_TERMINAL_UVICORN_TIMEOUT_KEEP_ALIVE` or `uvicorn_timeout_keep_alive` in TOML. Unset by default, preserving Uvicorn's default behavior.
+
 ## [0.14.3] - 2026-10-24
 
 ### Fixed

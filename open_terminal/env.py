@@ -164,6 +164,14 @@ UVICORN_LOOP = os.environ.get(
     config.get("uvicorn_loop", "auto"),
 )
 
+UVICORN_TIMEOUT_KEEP_ALIVE: float | None = None
+_uvicorn_timeout_keep_alive = os.environ.get(
+    "OPEN_TERMINAL_UVICORN_TIMEOUT_KEEP_ALIVE",
+    config.get("uvicorn_timeout_keep_alive"),
+)
+if _uvicorn_timeout_keep_alive is not None:
+    UVICORN_TIMEOUT_KEEP_ALIVE = float(_uvicorn_timeout_keep_alive)
+
 OPEN_TERMINAL_INFO = os.environ.get(
     "OPEN_TERMINAL_INFO",
     config.get("info", ""),
