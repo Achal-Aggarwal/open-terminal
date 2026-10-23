@@ -29,10 +29,10 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile,
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.formparsers import MultiPartParser, MultiPartException, parse_options_header
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
+from open_terminal.dependencies import get_filesystem, verify_api_key
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
 from open_terminal.env import sanitized_environ
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner, read_pty, write_pty, PtyRunner
@@ -48,7 +48,7 @@ MAX_CONTENT_SEARCH_FILE_SIZE = 1 * 1024 * 1024
 log = logging.getLogger(__name__)
 
 if MULTI_USER:
-    from open_terminal.utils.user_isolation import check_environment, resolve_user
+    from open_terminal.utils.user_isolation import check_environment
     check_environment()
 
 if not API_KEY:
@@ -135,33 +135,6 @@ _EXECUTE_DESCRIPTION = (
 )
 if EXECUTE_DESCRIPTION:
     _EXECUTE_DESCRIPTION += "\n\n" + EXECUTE_DESCRIPTION
-
-bearer_scheme = HTTPBearer(auto_error=False)
-
-
-async def verify_api_key(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
-):
-    if not API_KEY:
-        return
-    if not credentials or not hmac.compare_digest(credentials.credentials, API_KEY):
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-
-def get_filesystem(request: Request) -> UserFS:
-    """Build a :class:`UserFS` scoped to the requesting user.
-
-    Multi-user mode requires ``X-User-Id`` to select the user's workspace.
-    Otherwise returns a plain ``UserFS`` using stdlib.
-    """
-    if not MULTI_USER:
-        return UserFS()
-    user_id = request.headers.get("x-user-id")
-    if not user_id:
-        raise HTTPException(status_code=400, detail="X-User-Id is required in multi-user mode")
-    username, home = resolve_user(user_id)
-    return UserFS(username=username, home=home)
-
 
 def get_file_browser_root(fs: UserFS) -> dict[str, str] | None:
     configured = FILE_BROWSER_ROOT.strip()
@@ -2228,6 +2201,6 @@ if ENABLE_TERMINAL:
 # ---------------------------------------------------------------------------
 
 if ENABLE_NOTEBOOKS:
-    from open_terminal.utils.notebooks import create_notebooks_router
+    from open_terminal.utils import notebooks
 
-    app.include_router(create_notebooks_router(verify_api_key))
+    app.include_router(notebooks.router)
