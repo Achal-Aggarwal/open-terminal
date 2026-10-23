@@ -151,15 +151,14 @@ async def verify_api_key(
 def get_filesystem(request: Request) -> UserFS:
     """Build a :class:`UserFS` scoped to the requesting user.
 
-    When multi-user mode is active and the ``X-User-Id`` header is present,
-    returns a ``UserFS`` that routes all I/O through ``sudo -u``.
+    Multi-user mode requires ``X-User-Id`` to select the user's workspace.
     Otherwise returns a plain ``UserFS`` using stdlib.
     """
     if not MULTI_USER:
         return UserFS()
     user_id = request.headers.get("x-user-id")
     if not user_id:
-        return UserFS()
+        raise HTTPException(status_code=400, detail="X-User-Id is required in multi-user mode")
     username, home = resolve_user(user_id)
     return UserFS(username=username, home=home)
 
@@ -387,10 +386,10 @@ _EXPIRY_SECONDS = 300  # auto-clean finished processes after 5 min
 # ---------------------------------------------------------------------------
 # Per-session working directory tracking
 # ---------------------------------------------------------------------------
-# Maps session_id → (absolute_cwd_path, last_accessed_timestamp).
+# Maps (user home, session_id) → (absolute_cwd_path, last_accessed_timestamp).
 # Replaces the old os.chdir() approach which was process-global and unsafe
 # with concurrent sessions.
-_session_cwds: dict[str, tuple[str, float]] = {}
+_session_cwds: dict[tuple[str, str], tuple[str, float]] = {}
 
 
 
@@ -405,18 +404,19 @@ def _expire_session_cwds():
 def _get_session_cwd(session_id: str | None, fs: "UserFS") -> str:
     """Return the tracked cwd for *session_id*, or ``fs.home`` as default."""
     _expire_session_cwds()
-    if session_id and session_id in _session_cwds:
-        cwd, _ = _session_cwds[session_id]
-        _session_cwds[session_id] = (cwd, time.time())  # refresh TTL
+    key = (fs.home, session_id)
+    if session_id and key in _session_cwds:
+        cwd, _ = _session_cwds[key]
+        _session_cwds[key] = (cwd, time.time())  # refresh TTL
         return cwd
     return fs.home
 
 
-def _set_session_cwd(session_id: str | None, path: str):
+def _set_session_cwd(session_id: str | None, path: str, fs: "UserFS"):
     """Store a session's cwd.  No-op if *session_id* is ``None``."""
     if session_id:
         _expire_session_cwds()
-        _session_cwds[session_id] = (path, time.time())
+        _session_cwds[(fs.home, session_id)] = (path, time.time())
 
 
 from open_terminal.utils.log import log_process, log_response
@@ -608,9 +608,9 @@ async def set_cwd(
 ):
     session_id = http_request.headers.get("x-session-id")
     target = fs.resolve_path(request.path)
-    if not fs.username and not await fs.isdir(target):
+    if not await fs.isdir(target):
         raise HTTPException(status_code=404, detail="Directory not found")
-    _set_session_cwd(session_id, target)
+    _set_session_cwd(session_id, target, fs)
     return {"cwd": target}
 
 
