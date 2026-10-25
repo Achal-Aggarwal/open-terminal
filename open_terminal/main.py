@@ -1,5 +1,4 @@
 import asyncio
-import hmac
 from importlib.metadata import version as _pkg_version
 import fnmatch
 import heapq
@@ -32,7 +31,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.formparsers import MultiPartParser, MultiPartException, parse_options_header
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
-from open_terminal.dependencies import get_filesystem, verify_api_key
+from open_terminal.dependencies import get_filesystem, matches_api_key, verify_api_key
 from open_terminal.env import API_KEY, BINARY_FILE_MIME_PREFIXES, CORS_ALLOWED_ORIGINS, ENABLE_NOTEBOOKS, ENABLE_SYSTEM_PROMPT, ENABLE_TERMINAL, EXECUTE_DESCRIPTION, EXECUTE_TIMEOUT, FILE_BROWSER_ROOT, LOG_DIR, MAX_TERMINAL_SESSIONS, MULTI_USER, OPEN_TERMINAL_INFO, PROCESS_LOG_RETENTION, SESSION_CWD_TTL, SYSTEM_PROMPT, TERMINAL_TERM
 from open_terminal.env import sanitized_environ
 from open_terminal.utils.runner import PipeRunner, ProcessRunner, create_runner, read_pty, write_pty, PtyRunner
@@ -2102,10 +2101,10 @@ if ENABLE_TERMINAL:
         try:
             msg = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
             payload = json.loads(msg)
-            if payload.get("type") != "auth" or (API_KEY and not hmac.compare_digest(payload.get("token", ""), API_KEY)):
+            if not isinstance(payload, dict) or payload.get("type") != "auth" or (API_KEY and not matches_api_key(payload.get("token"))):
                 await ws.close(code=4001, reason="Invalid API key")
                 return
-        except (asyncio.TimeoutError, ValueError, AttributeError, WebSocketDisconnect):
+        except (asyncio.TimeoutError, ValueError, AttributeError, KeyError, WebSocketDisconnect):
             await ws.close(code=4001, reason="Auth timeout or invalid payload")
             return
         if (
